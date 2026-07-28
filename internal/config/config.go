@@ -47,7 +47,7 @@ var (
 
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:          envString("HTTP_ADDR", ":8080"),
+		HTTPAddr:          listenAddress(),
 		DatabaseURL:       strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		GitHubToken:       strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
 		DataAdminPassword: os.Getenv("DATA_ADMIN_PASSWORD"),
@@ -214,11 +214,14 @@ func hasParentPath(filePath string) bool {
 	return false
 }
 
-func envString(name, fallback string) string {
-	if value, ok := os.LookupEnv(name); ok {
-		return strings.TrimSpace(value)
+func listenAddress() string {
+	if address := strings.TrimSpace(os.Getenv("HTTP_ADDR")); address != "" {
+		return address
 	}
-	return fallback
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		return ":" + port
+	}
+	return ":8080"
 }
 
 func envBool(name string, fallback bool) (bool, error) {

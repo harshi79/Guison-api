@@ -24,8 +24,55 @@ docker compose up --build
 The initial automatic import may take a minute. Check readiness with:
 
 ```bash
-curl http://localhost:8080/readyz
+curl http://localhost:8080/healthz
+curl -i http://localhost:8080/readyz
 ```
+
+## Deploy with Docker and external PostgreSQL
+
+Only two application settings are required:
+
+```env
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require
+DATA_ADMIN_PASSWORD=use-a-unique-random-value-of-at-least-16-characters
+```
+
+The PostgreSQL user must be able to create tables and indexes in its database and read/write those tables. Use the exact TLS options supplied by your database provider; some private databases use a different `sslmode`.
+
+Build and run:
+
+```bash
+docker build -t open-bin-api .
+
+cat > production.env <<'EOF'
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require
+DATA_ADMIN_PASSWORD=use-a-unique-random-value-of-at-least-16-characters
+EOF
+
+docker run -d \
+  --name open-bin-api \
+  --restart unless-stopped \
+  --env-file production.env \
+  -p 8080:8080 \
+  open-bin-api
+```
+
+For a Docker-compatible hosting provider, deploy the repository's `Dockerfile` and set the same two environment variables in the provider's secret settings. The application listens on `HTTP_ADDR` when set, otherwise on the provider's `PORT`, otherwise on port `8080`.
+
+### First boot
+
+On a fresh database the application:
+
+1. Connects to PostgreSQL and applies its embedded schema migrations.
+2. Registers the built-in GitHub CSV source.
+3. Starts the HTTP server and the startup import check.
+4. Downloads and validates the source CSV in temporary storage.
+5. Commits all imported records in one PostgreSQL transaction.
+6. Changes `/readyz` from `503` to `200`; lookups are then available.
+
+`/healthz` returns `200` once the HTTP process is running. `/readyz` returns `503` until at least one usable dataset has committed. A GitHub failure leaves the process running and readiness false on a fresh database; the error is visible in logs and on `/data`. When the database already contains usable records, a later GitHub failure leaves those records online and readiness stays true.
+
+PostgreSQL connection or migration failures stop startup with a non-zero exit and a clear log message. This is intentional: the API never pretends to be healthy without its database.
 
 ## Lookup API
 
@@ -54,7 +101,7 @@ The page uses HTTP Basic authentication:
 
 The password is never included in page HTML or frontend JavaScript. There is no JavaScript on the page. Always serve the application over HTTPS in production because Basic authentication credentials must be protected in transit.
 
-The page also uses a server-generated CSRF token, disables caching, blocks framing, and applies a restrictive Content Security Policy.
+The page also uses a server-generated CSRF token, disables caching, blocks framing, and applies a restrictive Content Security Policy. Its forms and redirects use same-origin `/data/...` paths and contain no localhost or hardcoded domain. If a hosting proxy filters headers, configure it to forward the standard `Authorization` header used by Basic Auth.
 
 ### Manual CSV import
 
@@ -102,7 +149,8 @@ The built-in source is the CC BY 4.0 dataset at [`venelinkochev/bin-list-data`](
 |---|---:|---|
 | `DATABASE_URL` | required | PostgreSQL connection URL |
 | `DATA_ADMIN_PASSWORD` | required | Protects `/data`; minimum 16 characters |
-| `HTTP_ADDR` | `:8080` | HTTP listen address |
+| `HTTP_ADDR` | empty | Explicit HTTP listen address; overrides `PORT` |
+| `PORT` | `8080` | Hosting-provider port used when `HTTP_ADDR` is empty |
 | `SYNC_ENABLED` | `true` | Enable periodic GitHub checks |
 | `SYNC_ON_START` | `true` | Check configured sources at startup |
 | `SYNC_INTERVAL` | `5m` | Check interval; minimum `30s` |

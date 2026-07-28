@@ -32,6 +32,19 @@ func TestLoadValidConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadUsesProviderPort(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("HTTP_ADDR", "")
+	t.Setenv("PORT", "9090")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPAddr != ":9090" {
+		t.Fatalf("HTTPAddr=%q, want :9090", cfg.HTTPAddr)
+	}
+}
+
 func TestLoadRejectsInvalidEnvironmentValue(t *testing.T) {
 	setValidEnvironment(t)
 	t.Setenv("SYNC_ENABLED", "sometimes")

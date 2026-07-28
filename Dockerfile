@@ -9,6 +9,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/binapi 
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/binapi /bin/binapi
+ENV TMPDIR=/tmp
 USER nonroot:nonroot
 EXPOSE 8080
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/bin/binapi"]
