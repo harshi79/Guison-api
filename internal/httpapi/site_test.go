@@ -1,10 +1,13 @@
 package httpapi
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/harshi79/project-17/internal/model"
 )
@@ -204,6 +207,7 @@ func TestSiteDoesNotLeakAdminDetails(t *testing.T) {
 // Telegram links must never ship as invented usernames.
 func TestTelegramLinksArePlaceholdersUntilConfigured(t *testing.T) {
 	t.Setenv(envTelegramChannel, "")
+	t.Setenv(envTelegramPrivate, "")
 	t.Setenv(envTelegramDeveloper, "")
 
 	response := httptest.NewRecorder()
@@ -213,38 +217,69 @@ func TestTelegramLinksArePlaceholdersUntilConfigured(t *testing.T) {
 	if strings.Contains(body, "t.me/") {
 		t.Error("unconfigured build must not contain any t.me link")
 	}
-	if !strings.Contains(body, "TELEGRAM_CHANNEL_URL") {
-		t.Error("expected a visible setup hint naming the environment variable")
+	for _, name := range []string{"TELEGRAM_CHANNEL_URL", "TELEGRAM_PRIVATE_URL", "DEVELOPER_TELEGRAM_URL"} {
+		if !strings.Contains(body, name) {
+			t.Errorf("expected a visible setup hint naming %s", name)
+		}
 	}
-	if !strings.Contains(body, "disabled") {
-		t.Error("unconfigured Telegram buttons should be disabled")
+	// All three buttons must render disabled rather than as dead links.
+	if got := strings.Count(body, `disabled aria-disabled="true"`); got != 3 {
+		t.Errorf("disabled buttons=%d, want 3", got)
+	}
+	for _, label := range []string{"Official Channel", "Private Community", "Contact Developer"} {
+		if !strings.Contains(body, label) {
+			t.Errorf("missing community label %q", label)
+		}
 	}
 }
 
 func TestTelegramLinksRenderWhenConfigured(t *testing.T) {
-	t.Setenv(envTelegramChannel, "https://t.me/guison_channel")
-	t.Setenv(envTelegramDeveloper, "https://t.me/guison_dev")
+	t.Setenv(envTelegramChannel, "https://t.me/yorifederation")
+	t.Setenv(envTelegramPrivate, "https://t.me/+y8EekRvqpnQzNjZl")
+	t.Setenv(envTelegramDeveloper, "https://t.me/YorichiiPrime")
 
 	response := httptest.NewRecorder()
 	newSiteServer().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
 
 	for _, want := range []string{
-		"https://t.me/guison_channel", "https://t.me/guison_dev",
+		`href="https://t.me/yorifederation"`,
 		`rel="noopener noreferrer external"`,
+		"Official Channel", "Private Community", "Contact Developer",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("configured page missing %q", want)
 		}
 	}
+	// The private invite must be reachable but never shown as page copy.
+	if !strings.Contains(body, "y8EekRvqpnQzNjZl") {
+		t.Error("private invite should be present as a link target")
+	}
+	if strings.Contains(body, ">https://t.me/") || strings.Contains(body, "> https://t.me/") {
+		t.Error("raw Telegram URLs must not be rendered as visible text")
+	}
+	// No setup hint should remain once everything is configured.
+	if strings.Contains(body, "Setup required") {
+		t.Error("setup hint should disappear when all links are configured")
+	}
+	if strings.Contains(body, `disabled aria-disabled="true"`) {
+		t.Error("no community button should be disabled once configured")
+	}
 }
 
 // Only http(s) destinations are accepted, so a hostile value cannot inject a scheme.
 func TestCommunityLinkRejectsUnsafeSchemes(t *testing.T) {
-	for _, value := range []string{"javascript:alert(1)", "data:text/html,x", "tg://resolve", "  "} {
-		t.Setenv(envTelegramChannel, value)
-		if link := communityLink(envTelegramChannel, "X"); link.Configured {
+	for _, value := range []string{
+		"javascript:alert(1)", "data:text/html,x", "tg://resolve",
+		"  ", "//evil.example.com", "vbscript:msgbox(1)",
+	} {
+		t.Setenv(envTelegramPrivate, value)
+		link := communityLink(envTelegramPrivate, "Private Community", "btn-ghost")
+		if link.Configured {
 			t.Errorf("value %q must not be accepted as a link", value)
+		}
+		if link.URL != "" {
+			t.Errorf("value %q must not populate a URL", value)
 		}
 	}
 }
@@ -270,5 +305,182 @@ func TestPublicBaseURL(t *testing.T) {
 	local.Host = "localhost:8080"
 	if got := publicBaseURL(local); got != "http://localhost:8080" {
 		t.Fatalf("local baseURL=%q", got)
+	}
+}
+
+// --- Public response must not leak internal source provenance ---
+
+// lookupResultWithSource mirrors a real row: internal provenance is populated
+// by the database layer on every lookup.
+func lookupResultWithSource() *model.LookupResult {
+	synced, _ := time.Parse(time.RFC3339, "2025-02-11T13:40:06Z")
+	length := int16(16)
+	luhn := true
+	return &model.LookupResult{
+		Match:  model.Match{Start: "457173", End: "457173", Length: 6},
+		Number: model.Number{Length: &length, Luhn: &luhn},
+		Scheme: "visa", Brand: "Visa/Dankort", Type: "debit",
+		Country: model.Country{Alpha2: "DK", Alpha3: "DNK", Name: "Denmark", Currency: "DKK"},
+		Bank:    model.Bank{Name: "Jyske Bank", URL: "www.jyskebank.dk"},
+		Source: model.Attribution{
+			ID: "bin-list-data", Repository: "venelinkochev/bin-list-data",
+			Commit: "023a4f6c1d", SyncedAt: synced,
+		},
+	}
+}
+
+func TestPublicLookupOmitsSourceObject(t *testing.T) {
+	handler := New(&fakeStore{result: lookupResultWithSource()}, &fakeImporter{}, "very-secret-password", 1<<20).Handler()
+
+	for _, path := range []string{"/45717360", "/v1/bin/45717360"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d", path, response.Code)
+		}
+
+		var body map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s invalid JSON: %v", path, err)
+		}
+		if _, present := body["source"]; present {
+			t.Errorf("%s still returns a source object", path)
+		}
+
+		// No replacement provenance key may appear either.
+		for _, banned := range []string{"repository", "commit", "synced_at", "attribution", "provenance", "dataset"} {
+			if _, present := body[banned]; present {
+				t.Errorf("%s exposes provenance key %q", path, banned)
+			}
+		}
+
+		// And nothing internal may leak anywhere in the raw payload.
+		raw := response.Body.String()
+		for _, secret := range []string{
+			"venelinkochev", "bin-list-data", "023a4f6c1d", "2025-02-11T13:40:06Z", "synced_at",
+		} {
+			if strings.Contains(raw, secret) {
+				t.Errorf("%s leaked internal value %q: %s", path, secret, raw)
+			}
+		}
+	}
+}
+
+// Removing source must not disturb the rest of the documented payload.
+func TestPublicLookupKeepsCardFields(t *testing.T) {
+	handler := New(&fakeStore{result: lookupResultWithSource()}, &fakeImporter{}, "very-secret-password", 1<<20).Handler()
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/45717360", nil))
+
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	for _, want := range []string{"iin", "match", "number", "scheme", "brand", "type", "level", "prepaid", "country", "bank"} {
+		if _, present := body[want]; !present {
+			t.Errorf("public response lost field %q", want)
+		}
+	}
+	if len(body) != 10 {
+		t.Errorf("public response has %d top-level fields, want exactly 10: %v", len(body), body)
+	}
+	if body["iin"] != "45717360" {
+		t.Errorf("iin=%v", body["iin"])
+	}
+}
+
+// Internal provenance must survive in the Go model even though it is not serialised.
+func TestInternalSourceTrackingStillPopulated(t *testing.T) {
+	store := &fakeStore{result: lookupResultWithSource()}
+	result, err := store.Lookup(context.Background(), "45717360")
+	if err != nil || result == nil {
+		t.Fatalf("lookup failed: %v", err)
+	}
+	if result.Source.ID != "bin-list-data" ||
+		result.Source.Repository != "venelinkochev/bin-list-data" ||
+		result.Source.Commit != "023a4f6c1d" ||
+		result.Source.SyncedAt.IsZero() {
+		t.Fatalf("internal source tracking was lost: %+v", result.Source)
+	}
+}
+
+// The admin page must still surface source status.
+func TestAdminPageStillShowsSourceStatus(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/data", nil)
+	request.SetBasicAuth("admin", "very-secret-password")
+	response := httptest.NewRecorder()
+	newSiteServer().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d", response.Code)
+	}
+	body := response.Body.String()
+	for _, want := range []string{"bin-list-data", "venelinkochev/bin-list-data", "374788"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/data lost source status %q", want)
+		}
+	}
+}
+
+// SourceStatus is an internal type and must keep its JSON tags for /data.
+func TestSourceStatusStillSerialises(t *testing.T) {
+	encoded, err := json.Marshal(model.SourceStatus{
+		ID: "bin-list-data", Repository: "venelinkochev/bin-list-data", CurrentCommit: "023a4f6",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"id"`, `"repository"`, `"current_commit"`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("SourceStatus lost %s", want)
+		}
+	}
+}
+
+// The public site must not document a field the API no longer returns.
+func TestSiteDoesNotDocumentSourceField(t *testing.T) {
+	handler := newSiteServer()
+	for _, path := range []string{"/", "/docs"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		body := response.Body.String()
+
+		for _, banned := range []string{
+			`"source"`, "source.id", "source.repository", "source.commit", "source.synced_at",
+		} {
+			if strings.Contains(body, banned) {
+				t.Errorf("%s still documents %q", path, banned)
+			}
+		}
+	}
+}
+
+// Dataset credit is deliberately kept, only per-response provenance is removed.
+func TestSiteKeepsDatasetCredit(t *testing.T) {
+	handler := newSiteServer()
+	for _, path := range []string{"/", "/docs"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		body := response.Body.String()
+		for _, want := range []string{"venelinkochev/bin-list-data", "CC BY 4.0"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s dropped dataset credit %q", path, want)
+			}
+		}
+	}
+}
+
+// The tester script must no longer reference the removed field.
+func TestTesterScriptHasNoSourceHandling(t *testing.T) {
+	response := httptest.NewRecorder()
+	newSiteServer().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/assets/site.js", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d", response.Code)
+	}
+	script := response.Body.String()
+	for _, banned := range []string{"data.source", "source.repository", "source.id"} {
+		if strings.Contains(script, banned) {
+			t.Errorf("tester still reads %q", banned)
+		}
 	}
 }

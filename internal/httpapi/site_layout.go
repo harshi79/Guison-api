@@ -70,8 +70,9 @@ const layoutHTML = `
       <div class="foot">
         <h4>Community</h4>
         <ul>
-          <li>{{if .TelegramChannel.Configured}}<a href="{{.TelegramChannel.URL | safeURL}}" target="_blank" rel="noopener noreferrer external">Telegram Channel</a>{{else}}<span style="color:var(--faint);font-size:.89rem">Telegram Channel (unset)</span>{{end}}</li>
-          <li>{{if .TelegramDev.Configured}}<a href="{{.TelegramDev.URL | safeURL}}" target="_blank" rel="noopener noreferrer external">Developer Telegram</a>{{else}}<span style="color:var(--faint);font-size:.89rem">Developer Telegram (unset)</span>{{end}}</li>
+          {{range .CommunityLinks}}
+          <li>{{if .Configured}}<a href="{{.URL | safeURL}}" target="_blank" rel="noopener noreferrer external">{{.Label}}</a>{{else}}<span style="color:var(--faint);font-size:.89rem">{{.Label}} (unset)</span>{{end}}</li>
+          {{end}}
           <li><a href="https://github.com/{{.SourceRepository}}" target="_blank" rel="noopener noreferrer external">Data Source</a></li>
         </ul>
       </div>

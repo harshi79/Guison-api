@@ -19,28 +19,41 @@ var siteAssets embed.FS
 // in the hosting provider to publish real destinations:
 //
 //	TELEGRAM_CHANNEL_URL   — public Telegram channel for announcements
+//	TELEGRAM_PRIVATE_URL   — private community invite link
 //	DEVELOPER_TELEGRAM_URL — direct contact for the maintainer
 //
 // When a value is missing the site renders a clearly marked placeholder and
 // disables the link, so a fake username is never shipped to production.
+// Destinations are rendered as labelled buttons; the raw URL is never printed
+// as visible page copy.
 const (
 	envTelegramChannel   = "TELEGRAM_CHANNEL_URL"
+	envTelegramPrivate   = "TELEGRAM_PRIVATE_URL"
 	envTelegramDeveloper = "DEVELOPER_TELEGRAM_URL"
 )
 
-// CommunityLink is one external community destination.
+// CommunityLink is one external community destination. Label is what the user
+// sees; URL is only ever used as a link target, never printed as page copy.
 type CommunityLink struct {
+	Label       string
 	URL         string
 	Configured  bool
 	Placeholder string
+	Style       string
 }
 
-func communityLink(envName, placeholder string) CommunityLink {
+// communityLink reads one destination from the environment. Only absolute
+// http(s) URLs are accepted, so a hostile or malformed value (javascript:,
+// data:, tg://) can never become a link target.
+func communityLink(envName, label, style string) CommunityLink {
+	link := CommunityLink{Label: label, Placeholder: envName, Style: style}
 	value := strings.TrimSpace(os.Getenv(envName))
 	if value == "" || !(strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://")) {
-		return CommunityLink{Configured: false, Placeholder: placeholder}
+		return link
 	}
-	return CommunityLink{URL: value, Configured: true, Placeholder: placeholder}
+	link.URL = value
+	link.Configured = true
+	return link
 }
 
 // siteView is the data passed to the public page templates.
@@ -54,8 +67,13 @@ type siteView struct {
 	SourceRepository string
 	LastSynced       string
 	TelegramChannel  CommunityLink
+	TelegramPrivate  CommunityLink
 	TelegramDev      CommunityLink
-	Year             int
+	// CommunityLinks is the ordered list rendered as buttons.
+	CommunityLinks []CommunityLink
+	// UnsetCommunityVars names the variables still needing configuration.
+	UnsetCommunityVars []string
+	Year               int
 }
 
 var sitePages = template.Must(template.New("site").Funcs(template.FuncMap{
@@ -113,9 +131,16 @@ func (s *Server) buildSiteView(r *http.Request, page string) siteView {
 		Description:      description,
 		BaseURL:          publicBaseURL(r),
 		SourceRepository: "venelinkochev/bin-list-data",
-		TelegramChannel:  communityLink(envTelegramChannel, "TELEGRAM_CHANNEL_URL"),
-		TelegramDev:      communityLink(envTelegramDeveloper, "DEVELOPER_TELEGRAM_URL"),
+		TelegramChannel:  communityLink(envTelegramChannel, "Official Channel", "btn-primary"),
+		TelegramPrivate:  communityLink(envTelegramPrivate, "Private Community", "btn-ghost"),
+		TelegramDev:      communityLink(envTelegramDeveloper, "Contact Developer", "btn-ghost"),
 		Year:             time.Now().Year(),
+	}
+	view.CommunityLinks = []CommunityLink{view.TelegramChannel, view.TelegramPrivate, view.TelegramDev}
+	for _, link := range view.CommunityLinks {
+		if !link.Configured {
+			view.UnsetCommunityVars = append(view.UnsetCommunityVars, link.Placeholder)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)

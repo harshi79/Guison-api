@@ -9,3 +9,10 @@ services:
         sync: false
       - key: DATA_ADMIN_PASSWORD
         sync: false
+      # Optional: public website community links.
+      - key: TELEGRAM_CHANNEL_URL
+        sync: false
+      - key: TELEGRAM_PRIVATE_URL
+        sync: false
+      - key: DEVELOPER_TELEGRAM_URL
+        sync: false

@@ -199,12 +199,6 @@ card = <span class="tok-c">lookup_bin</span>(<span class="tok-s">"45717360"</spa
     <span class="tok-k">"phone"</span>: <span class="tok-s">"+45 89 89 89 89"</span>,
     <span class="tok-k">"city"</span>: <span class="tok-s">"Silkeborg"</span>,
     <span class="tok-k">"logo"</span>: <span class="tok-s">""</span>
-  },
-  <span class="tok-k">"source"</span>: {
-    <span class="tok-k">"id"</span>: <span class="tok-s">"bin-list-data"</span>,
-    <span class="tok-k">"repository"</span>: <span class="tok-s">"{{.SourceRepository}}"</span>,
-    <span class="tok-k">"commit"</span>: <span class="tok-s">"023a4f6"</span>,
-    <span class="tok-k">"synced_at"</span>: <span class="tok-s">"2025-02-11T13:40:06Z"</span>
   }
 }</code></pre>
       </div>
@@ -238,12 +232,9 @@ card = <span class="tok-c">lookup_bin</span>(<span class="tok-s">"45717360"</spa
           <tr><td>bank.phone</td><td>string</td><td>Issuer contact phone.</td></tr>
           <tr><td>bank.city</td><td>string</td><td>Issuer city.</td></tr>
           <tr><td>bank.logo</td><td>string</td><td>Issuer logo reference when available.</td></tr>
-          <tr><td>source.id</td><td>string</td><td>Configured source identifier the record came from.</td></tr>
-          <tr><td>source.repository</td><td>string</td><td>Upstream repository for that source.</td></tr>
-          <tr><td>source.commit</td><td>string</td><td>Commit of the imported dataset version.</td></tr>
-          <tr><td>source.synced_at</td><td>string</td><td>RFC 3339 timestamp of the last successful import.</td></tr>
         </tbody>
       </table>
+      <p>These are all the fields a public lookup returns. Guison tracks internally which dataset and commit each record came from, but that provenance is not part of the public response &mdash; see <a href="#attribution">Source attribution</a> for dataset credit.</p>
       <h3>Nullable and empty values</h3>
       <p>Guison never invents data. Two conventions apply:</p>
       <ul>
@@ -303,8 +294,8 @@ card = <span class="tok-c">lookup_bin</span>(<span class="tok-s">"45717360"</spa
 
     <section class="doc-sec" id="attribution">
       <h2>Source attribution</h2>
-      <p>Every successful lookup includes a <code>source</code> object identifying exactly where the record came from &mdash; the source id, upstream repository, imported commit and sync timestamp. This makes results auditable and reproducible.</p>
-      <p>The current primary dataset is <a href="https://github.com/{{.SourceRepository}}" target="_blank" rel="noopener noreferrer external">{{.SourceRepository}}</a>, published under the
+      <p>Guison records internally which dataset and commit every stored range came from, and that provenance drives the automatic update process. It is <strong>not</strong> returned in public lookup responses, which stay limited to card metadata.</p>
+      <p>Dataset credit is published here rather than repeated in every response. The current primary dataset is <a href="https://github.com/{{.SourceRepository}}" target="_blank" rel="noopener noreferrer external">{{.SourceRepository}}</a>, published under the
         <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer external">Creative Commons Attribution 4.0 International licence</a>.</p>
       <p>If you redistribute data obtained from Guison, CC BY 4.0 requires that you credit the upstream dataset and indicate that changes were made. Guison normalises the source CSV into range records and serves it as JSON.</p>
       <div class="note" style="margin-top:18px">

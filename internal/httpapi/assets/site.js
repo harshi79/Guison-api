@@ -233,7 +233,6 @@
     var country = data.country || {};
     var bank = data.bank || {};
     var number = data.number || {};
-    var source = data.source || {};
 
     var countryText = null;
     if (present(country.name)) {
@@ -258,10 +257,10 @@
       ["Currency", present(country.currency)],
       ["Bank", present(bank.name)],
       ["Bank phone", present(bank.phone)],
+      ["Bank site", present(bank.url)],
       ["PAN length", present(number.length)],
       ["Luhn", present(number.luhn)],
-      ["Matched range", rangeText],
-      ["Source", present(source.repository) || present(source.id)]
+      ["Matched range", rangeText]
     ];
 
     var grid = element("div", "result-grid");

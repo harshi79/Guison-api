@@ -31,6 +31,12 @@ type Bank struct {
 	Logo  string `json:"logo"`
 }
 
+// Attribution records which imported dataset a lookup row came from.
+//
+// This is internal provenance. It is still read from PostgreSQL on every
+// lookup and remains available to logging, the syncer and the protected
+// /data administration page, but it is deliberately not serialised into
+// public API responses.
 type Attribution struct {
 	ID         string    `json:"id"`
 	Repository string    `json:"repository"`
@@ -39,17 +45,21 @@ type Attribution struct {
 }
 
 type LookupResult struct {
-	IIN     string      `json:"iin"`
-	Match   Match       `json:"match"`
-	Number  Number      `json:"number"`
-	Scheme  string      `json:"scheme"`
-	Brand   string      `json:"brand"`
-	Type    string      `json:"type"`
-	Level   string      `json:"level"`
-	Prepaid *bool       `json:"prepaid"`
-	Country Country     `json:"country"`
-	Bank    Bank        `json:"bank"`
-	Source  Attribution `json:"source"`
+	IIN     string  `json:"iin"`
+	Match   Match   `json:"match"`
+	Number  Number  `json:"number"`
+	Scheme  string  `json:"scheme"`
+	Brand   string  `json:"brand"`
+	Type    string  `json:"type"`
+	Level   string  `json:"level"`
+	Prepaid *bool   `json:"prepaid"`
+	Country Country `json:"country"`
+	Bank    Bank    `json:"bank"`
+
+	// Source is populated on every lookup and used internally, but is
+	// excluded from public JSON responses with `json:"-"`. Public clients
+	// must not receive upstream repository, commit or sync details.
+	Source Attribution `json:"-"`
 }
 
 type SourceStatus struct {

@@ -113,8 +113,8 @@ const homeHTML = `
       </div>
       <div class="card">
         <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-        <h3>Source attribution</h3>
-        <p>Every response names the dataset, repository and commit the record came from, plus its sync time.</p>
+        <h3>Validated imports</h3>
+        <p>Each update is parsed and validated in a staging table before it replaces live data, so a bad import never takes lookups down.</p>
       </div>
       <div class="card">
         <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m8 6-6 6 6 6M16 6l6 6-6 6"/></svg></div>
@@ -196,8 +196,7 @@ const homeHTML = `
   <span class="tok-k">"level"</span>: <span class="tok-s">""</span>,
   <span class="tok-k">"prepaid"</span>: <span class="tok-n">null</span>,
   <span class="tok-k">"country"</span>: { <span class="tok-k">"alpha2"</span>: <span class="tok-s">"DK"</span>, <span class="tok-k">"name"</span>: <span class="tok-s">"Denmark"</span>, <span class="tok-k">"emoji"</span>: <span class="tok-s">"\U0001F1E9\U0001F1F0"</span> },
-  <span class="tok-k">"bank"</span>: { <span class="tok-k">"name"</span>: <span class="tok-s">"Jyske Bank"</span> },
-  <span class="tok-k">"source"</span>: { <span class="tok-k">"id"</span>: <span class="tok-s">"bin-list-data"</span> }
+  <span class="tok-k">"bank"</span>: { <span class="tok-k">"name"</span>: <span class="tok-s">"Jyske Bank"</span>, <span class="tok-k">"url"</span>: <span class="tok-s">"www.jyskebank.dk"</span> }
 }</code></pre>
       </div>
     </div>
@@ -232,25 +231,20 @@ const homeHTML = `
       <div>
         <div class="tg-icon" aria-hidden="true">{{template "tgicon" .}}</div>
         <h2 style="margin-bottom:10px">Join the Guison community</h2>
-        <p style="color:var(--muted);margin:0;max-width:48ch">Follow the channel for dataset updates, new endpoints and status notices &mdash; or message the developer directly with questions and integration help.</p>
-        {{if not (and .TelegramChannel.Configured .TelegramDev.Configured)}}
+        <p style="color:var(--muted);margin:0;max-width:48ch">Follow the official channel for dataset updates and status notices, join the private community, or message the developer directly with integration questions.</p>
+        {{if .UnsetCommunityVars}}
         <p class="tg-note">Setup required: set
-          {{if not .TelegramChannel.Configured}}<code>{{.TelegramChannel.Placeholder}}</code>{{end}}
-          {{if and (not .TelegramChannel.Configured) (not .TelegramDev.Configured)}} and {{end}}
-          {{if not .TelegramDev.Configured}}<code>{{.TelegramDev.Placeholder}}</code>{{end}}
-          in the environment to activate {{if and (not .TelegramChannel.Configured) (not .TelegramDev.Configured)}}these buttons{{else}}this button{{end}}.</p>
+          {{range $index, $name := .UnsetCommunityVars}}{{if $index}}, {{end}}<code>{{$name}}</code>{{end}}
+          in the environment to activate the disabled {{if gt (len .UnsetCommunityVars) 1}}buttons{{else}}button{{end}}.</p>
         {{end}}
       </div>
       <div class="tg-actions">
-        {{if .TelegramChannel.Configured}}
-        <a class="btn btn-primary" href="{{.TelegramChannel.URL | safeURL}}" target="_blank" rel="noopener noreferrer external">{{template "tgicon" .}} Join our Telegram</a>
+        {{range .CommunityLinks}}
+        {{if .Configured}}
+        <a class="btn {{.Style}}" href="{{.URL | safeURL}}" target="_blank" rel="noopener noreferrer external">{{template "tgicon" .}} {{.Label}}</a>
         {{else}}
-        <button class="btn btn-primary" type="button" disabled aria-disabled="true" title="Set TELEGRAM_CHANNEL_URL to enable">{{template "tgicon" .}} Join our Telegram</button>
+        <button class="btn {{.Style}}" type="button" disabled aria-disabled="true" title="Set {{.Placeholder}} to enable">{{template "tgicon" .}} {{.Label}}</button>
         {{end}}
-        {{if .TelegramDev.Configured}}
-        <a class="btn btn-ghost" href="{{.TelegramDev.URL | safeURL}}" target="_blank" rel="noopener noreferrer external">{{template "tgicon" .}} Contact Developer</a>
-        {{else}}
-        <button class="btn btn-ghost" type="button" disabled aria-disabled="true" title="Set DEVELOPER_TELEGRAM_URL to enable">{{template "tgicon" .}} Contact Developer</button>
         {{end}}
       </div>
     </div>
@@ -283,7 +277,7 @@ const homeHTML = `
         </details>
         <details class="faq">
           <summary>Where does the data come from?{{template "caret" .}}</summary>
-          <div class="faq-body"><p>From openly licensed public datasets. The current primary source is <a href="https://github.com/{{.SourceRepository}}" target="_blank" rel="noopener noreferrer external">{{.SourceRepository}}</a>, licensed CC BY 4.0. Every lookup response includes a <code>source</code> object naming the dataset and commit it came from.</p></div>
+          <div class="faq-body"><p>From openly licensed public datasets. The current primary source is <a href="https://github.com/{{.SourceRepository}}" target="_blank" rel="noopener noreferrer external">{{.SourceRepository}}</a>, licensed CC BY 4.0. Dataset credit is published here and in the project README; individual lookup responses stay lean and do not repeat it.</p></div>
         </details>
         <details class="faq">
           <summary>How often is data updated?{{template "caret" .}}</summary>

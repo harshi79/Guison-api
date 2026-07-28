@@ -1,238 +1,298 @@
-# Open BIN API
+# Guison API
 
-A small Go + PostgreSQL service for looking up BIN/IIN information and keeping the dataset up to date.
+A lightweight, open-source BIN/IIN lookup API with automatic dataset synchronization, PostgreSQL persistence, a public website, developer docs, and a protected data administration interface.
 
-## What it does
-
-- Public BIN lookup: `GET /{bin}`
-- Alternative lookup route: `GET /v1/bin/{bin}`
-- Lightweight uptime endpoint: `GET /health`
-- Password-protected data page: `GET /data`
-- Manual CSV upload with merge or replace mode
-- Periodic import from configured GitHub CSV files
-- Safe updates: the current dataset keeps serving until a complete replacement import commits
-
-The API accepts 6 to 8 digits. It intentionally rejects full card numbers.
-
-## Run locally
+Send the first 6–8 digits of a payment card and get back the card scheme, funding type, product level, issuing bank and country as JSON. No API key, no SDK, no sign-up.
 
 ```bash
-cp .env.example .env
-# Edit .env and set a long, random DATA_ADMIN_PASSWORD.
-docker compose up --build
+curl https://guison-api.onrender.com/45717360
 ```
 
-The initial automatic import may take a minute. Check readiness with:
+> **Guison is a metadata lookup service.** It does **not** verify that a card or account exists, is active, or is valid, and it cannot authorise a payment. See [Data source & credits](#data-source--credits).
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Live API](#live-api)
+- [Quick start](#quick-start)
+- [API endpoints](#api-endpoints)
+- [Input rules](#input-rules)
+- [Response](#response)
+- [Errors](#errors)
+- [Local installation](#local-installation)
+- [Environment variables](#environment-variables)
+- [Docker](#docker)
+- [Docker Compose](#docker-compose)
+- [Render deployment](#render-deployment)
+- [Deploy anywhere](#deploy-anywhere)
+- [Administration](#administration)
+- [Data import & automatic sync](#data-import--automatic-sync)
+- [Project structure](#project-structure)
+- [Security](#security)
+- [Data source & credits](#data-source--credits)
+- [License](#license)
+- [Community](#community)
+- [Contributing](#contributing)
+- [Testing](#testing)
+
+---
+
+## Features
+
+- **6–8 digit BIN/IIN lookup** — query with 6, 7 or 8 digits; the most specific matching range wins
+- **Large baseline dataset** — currently around 374K imported BIN records from the configured upstream source
+- **Card scheme / network** — Visa, Mastercard, Amex, and others where the dataset provides them
+- **Card type** — debit or credit funding type
+- **Card level** — product tier such as classic or platinum, when available
+- **Country information** — ISO alpha-2/alpha-3, country name, flag emoji, currency, approximate coordinates
+- **Issuer / bank information** — bank name plus website, phone and city where known
+- **PostgreSQL persistence** — records stored as integer ranges with range-overlap indexing
+- **Automatic upstream synchronization** — periodic commit checks against configured GitHub CSV sources
+- **Validated transactional imports** — parsed into a staging table and committed atomically; a failed import never takes live data down
+- **Manual CSV import** — merge or replace a manual dataset from the admin page
+- **Public homepage** with an interactive BIN tester
+- **Developer documentation** at `/docs`
+- **Health and readiness endpoints** for uptime monitors and orchestrators
+- **Docker support** via a multi-stage distroless build
+- **Render compatible**, with a `render.yaml` blueprint
+- **Lightweight Go implementation** — one dependency (`pgx`), no frontend build step
+
+---
+
+## Live API
+
+| | |
+|---|---|
+| Base URL | <https://guison-api.onrender.com> |
+| Homepage | <https://guison-api.onrender.com/> |
+| Documentation | <https://guison-api.onrender.com/docs> |
+| Example lookup | <https://guison-api.onrender.com/45717360> |
+
+---
+
+## Quick start
+
+```bash
+curl https://guison-api.onrender.com/45717360
+```
+
+```json
+{
+  "iin": "45717360",
+  "match": {
+    "start": "457173",
+    "end": "457173",
+    "length": 6
+  },
+  "number": {
+    "length": 16,
+    "luhn": true
+  },
+  "scheme": "visa",
+  "brand": "Visa/Dankort",
+  "type": "debit",
+  "level": "",
+  "prepaid": null,
+  "country": {
+    "alpha2": "DK",
+    "alpha3": "DNK",
+    "name": "Denmark",
+    "emoji": "🇩🇰",
+    "currency": "DKK",
+    "latitude": null,
+    "longitude": null
+  },
+  "bank": {
+    "name": "Jyske Bank",
+    "url": "www.jyskebank.dk",
+    "phone": "+45 89 89 89 89",
+    "city": "Silkeborg",
+    "logo": ""
+  }
+}
+```
+
+Public routes send permissive CORS headers (`Access-Control-Allow-Origin: *`, methods `GET, OPTIONS`), so browser `fetch` works without a proxy.
+
+---
+
+## API endpoints
+
+| Method & path | Returns | Description |
+|---|---|---|
+| `GET /{bin}` | JSON | Primary lookup for a 6–8 digit BIN/IIN |
+| `GET /v1/bin/{bin}` | JSON | Versioned lookup; identical behaviour and response |
+| `GET /health` | `text/plain` | Service-alive check for uptime monitors; returns `OK` |
+| `GET /healthz` | JSON | Application health with process uptime |
+| `GET /readyz` | JSON | Whether usable BIN data is currently available |
+| `GET /` | HTML | Public homepage |
+| `GET /docs` | HTML | Developer documentation |
+
+`GET /data` is a **protected administration interface** and is not part of the public API. See [Administration](#administration).
+
+Lookup responses are sent with `Cache-Control: no-store`, so a completed import is visible on the very next request.
+
+```bash
+curl https://guison-api.onrender.com/health    # OK
+curl https://guison-api.onrender.com/healthz   # {"status":"ok","uptime_seconds":86400}
+curl https://guison-api.onrender.com/readyz    # {"status":"ready"}
+```
+
+---
+
+## Input rules
+
+- Must be **6 to 8 digits**
+- Digits `0-9` only — no spaces, dashes or letters
+- Leading zeros are significant; always send the value as a string
+- Anything shorter than 6, longer than 8, or non-numeric returns `400 invalid_iin`
+
+The 8-digit ceiling is enforced by the API, which means a full card number can never be submitted. Truncate to the first 6–8 digits on your side, and never log or transmit a full PAN.
+
+**Guison performs BIN/IIN metadata lookup only.** It does not verify that a payment card or account exists, is active, or has funds, and it cannot authorise or validate a transaction.
+
+---
+
+## Response
+
+| Field | Type | Notes |
+|---|---|---|
+| `iin` | string | The BIN/IIN exactly as sent |
+| `match.start` | string | First BIN in the matched range |
+| `match.end` | string | Last BIN in the matched range; equals `start` for single-BIN records |
+| `match.length` | number | Digit width of the matched range (6, 7 or 8) |
+| `number.length` | number \| **null** | Expected full card number length |
+| `number.luhn` | boolean \| **null** | Whether the Luhn check digit applies |
+| `scheme` | string | Card scheme/network; `""` when unknown |
+| `brand` | string | Product brand; `""` when unknown |
+| `type` | string | `debit` or `credit`; `""` when unknown |
+| `level` | string | Product level; `""` when unknown |
+| `prepaid` | boolean \| **null** | Prepaid flag |
+| `country.alpha2` | string | ISO 3166-1 alpha-2 code |
+| `country.alpha3` | string | ISO 3166-1 alpha-3 code |
+| `country.name` | string | Country name |
+| `country.emoji` | string | Flag emoji derived from the alpha-2 code |
+| `country.currency` | string | Currency code |
+| `country.latitude` | number \| **null** | Approximate country latitude |
+| `country.longitude` | number \| **null** | Approximate country longitude |
+| `bank.name` | string | Issuing bank name |
+| `bank.url` | string | Issuer website |
+| `bank.phone` | string | Issuer contact phone |
+| `bank.city` | string | Issuer city |
+| `bank.logo` | string | Issuer logo reference |
+
+### Nullable and empty values
+
+Guison never invents data. Two conventions apply:
+
+- **String fields** return `""` when the dataset has no value
+- **Optional typed fields** — `prepaid`, `number.length`, `number.luhn`, `country.latitude`, `country.longitude` — return `null`
+
+Guard against both. In JavaScript, prefer `card.bank?.name || "Unknown"`.
+
+> Public lookup responses contain card metadata only. Guison tracks internally which dataset and commit each record came from — that provenance drives automatic updates and is visible on the admin page — but it is not returned to public clients. Dataset credit is published in [Data source & credits](#data-source--credits).
+
+---
+
+## Errors
+
+Errors use a consistent envelope with a stable machine-readable `code`:
+
+```json
+{
+  "error": {
+    "code": "invalid_iin",
+    "message": "IIN must contain 6 to 8 digits"
+  }
+}
+```
+
+| Status | Code | When |
+|---|---|---|
+| `400` | `invalid_iin` | Not 6–8 characters, or contains a non-digit. Message is `IIN must contain 6 to 8 digits` or `IIN must contain only digits` |
+| `404` | `not_found` | Valid input, but no record covers it. Message is `No record covers this BIN/IIN` |
+| `500` | `internal_error` | Unexpected server or database failure. Message is `An internal error occurred`; details are logged server-side, never returned |
+| `503` | `not_ready` | Returned by `/readyz` when no usable dataset is loaded yet |
+
+Treat `404` as a normal outcome, not a failure — it means the BIN is not in the dataset. Retry `500` and `503` with backoff.
+
+---
+
+## Local installation
+
+**Requirements:** Go 1.24+ and PostgreSQL 14+.
+
+```bash
+git clone https://github.com/harshi79/project-17.git
+cd project-17
+
+cp .env.example .env
+# Edit .env: set DATABASE_URL and a DATA_ADMIN_PASSWORD of at least 16 characters.
+
+go mod download
+go run ./cmd/binapi
+```
+
+The server applies its embedded schema migrations on startup, registers the configured source, and begins the first import. Watch readiness with:
 
 ```bash
 curl http://localhost:8080/healthz
-curl -i http://localhost:8080/readyz
-```
-
-## Deploy with Docker and external PostgreSQL
-
-Only two application settings are required:
-
-```env
-DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require
-DATA_ADMIN_PASSWORD=use-a-unique-random-value-of-at-least-16-characters
-```
-
-The PostgreSQL user must be able to create tables and indexes in its database and read/write those tables. Use the exact TLS options supplied by your database provider; some private databases use a different `sslmode`.
-
-Build and run:
-
-```bash
-docker build -t open-bin-api .
-
-cat > production.env <<'EOF'
-DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require
-DATA_ADMIN_PASSWORD=use-a-unique-random-value-of-at-least-16-characters
-EOF
-
-docker run -d \
-  --name open-bin-api \
-  --restart unless-stopped \
-  --env-file production.env \
-  -p 8080:8080 \
-  open-bin-api
-```
-
-For a Docker-compatible hosting provider, deploy the repository's `Dockerfile` and set the same two environment variables in the provider's secret settings. The application listens on `HTTP_ADDR` when set, otherwise on the provider's `PORT`, otherwise on port `8080`.
-
-### First boot
-
-On a fresh database the application:
-
-1. Connects to PostgreSQL and applies its embedded schema migrations.
-2. Registers the built-in GitHub CSV source.
-3. Starts the HTTP server and the startup import check.
-4. Downloads and validates the source CSV in temporary storage.
-5. Commits all imported records in one PostgreSQL transaction.
-6. Changes `/readyz` from `503` to `200`; lookups are then available.
-
-`/healthz` returns `200` once the HTTP process is running. `/readyz` returns `503` until at least one usable dataset has committed. A GitHub failure leaves the process running and readiness false on a fresh database; the error is visible in logs and on `/data`. When the database already contains usable records, a later GitHub failure leaves those records online and readiness stays true.
-
-PostgreSQL connection or migration failures stop startup with a non-zero exit and a clear log message. This is intentional: the API never pretends to be healthy without its database.
-
-## Deploy on Render
-
-The repository is ready for a Render **Web Service** using the Docker runtime. Render builds the Go binary inside Docker; no Go installation or build command is needed on Render.
-
-1. Push or select this GitHub repository and branch.
-2. In Render, choose **New → Web Service**.
-3. Connect the repository.
-4. Select **Docker** as the runtime. Render uses the root `Dockerfile` automatically.
-5. Add these environment variables:
-
-   ```text
-   DATABASE_URL=<your hosted PostgreSQL connection URL>
-   DATA_ADMIN_PASSWORD=<a unique random value of at least 16 characters>
-   ```
-
-6. Set the health check path to `/health` under the service's advanced settings.
-7. Deploy. Do not set `PORT`; Render provides it and the application binds to `0.0.0.0:$PORT` automatically.
-8. Open `https://YOUR-SERVICE.onrender.com/health` and expect `OK` with HTTP `200`.
-9. Wait for `https://YOUR-SERVICE.onrender.com/readyz` to return HTTP `200` after the first import.
-10. Test `https://YOUR-SERVICE.onrender.com/45717360`.
-11. Open `https://YOUR-SERVICE.onrender.com/data` and sign in with username `admin` and `DATA_ADMIN_PASSWORD`.
-
-A minimal [`render.yaml`](render.yaml) is included for users who prefer **New → Blueprint**. It creates one Docker web service, sets `/health` as Render's health check, and prompts for the two required secrets. It does not provision a database; set `DATABASE_URL` to your external or Render PostgreSQL connection string.
-
-Render terminates public HTTPS before forwarding requests to the container. `/data` uses same-origin form actions and standard Basic Auth, so it does not need a Render-specific hostname or proxy configuration.
-
-### UptimeRobot
-
-Create an **HTTP(S)** monitor with this URL:
-
-```text
-https://YOUR-SERVICE.onrender.com/health
-```
-
-Expect HTTP `200`. This endpoint returns only `OK`; it does not query PostgreSQL, contact GitHub, check dataset readiness, trigger imports, or require authentication. Continue using `/readyz` separately when you need to know whether BIN data is available.
-
-Health endpoint meanings:
-
-- `/health`: minimal process-liveness response for Render and UptimeRobot.
-- `/healthz`: application process health with uptime information; no database query.
-- `/readyz`: queries PostgreSQL and returns `200` only when at least one usable dataset exists.
-
-## Public website
-
-The Go server also renders the public site. No frontend build step, framework or
-separate deployment is involved; the HTML is server-rendered and the CSS, JS and
-artwork are embedded into the binary with `go:embed`.
-
-- `/` — landing page with a live BIN tester, features, endpoints and FAQ
-- `/docs` — full developer documentation
-- `/assets/...` — embedded CSS, JS and artwork
-
-Set `TELEGRAM_CHANNEL_URL` and `DEVELOPER_TELEGRAM_URL` to activate the community
-buttons. While unset, the site renders a disabled placeholder rather than a
-fabricated link.
-
-The artwork in `internal/httpapi/assets/art/` is original, generated for this
-project, and safe to replace: drop in a file with the same name and size.
-
-## Lookup API
-
-```bash
+curl -i http://localhost:8080/readyz    # 503 until the first import commits
 curl http://localhost:8080/45717360
-# or
-curl http://localhost:8080/v1/bin/45717360
 ```
 
-A successful response includes the matching range, scheme, card type, country, bank, and data source when those fields exist. Unknown fields are empty or `null`; the service does not guess them.
+Build a binary instead:
 
-Lookup responses use `Cache-Control: no-store`, so a successful admin import is visible to the next API request.
-
-## Data admin page
-
-Open:
-
-```text
-https://your-host/data
+```bash
+go build ./cmd/binapi          # or: make build
 ```
 
-The page uses HTTP Basic authentication:
+A `Makefile` provides `make test`, `make build`, `make run`, `make fmt`, `make vet`, `make compose-up` and `make compose-down`.
 
-- Username: `admin`
-- Password: the server-side `DATA_ADMIN_PASSWORD` environment variable (required, at least 16 characters)
-
-The password is never included in page HTML or frontend JavaScript. There is no JavaScript on the page. Always serve the application over HTTPS in production because Basic authentication credentials must be protected in transit.
-
-The page also uses a server-generated CSRF token, disables caching, blocks framing, and applies a restrictive Content Security Policy. Its forms and redirects use same-origin `/data/...` paths and contain no localhost or hardcoded domain. If a hosting proxy filters headers, configure it to forward the standard `Authorization` header used by Basic Auth.
-
-### Manual CSV import
-
-From `/data`:
-
-1. Choose a CSV file.
-2. Choose its format.
-3. Choose **Merge** or **Replace**.
-4. Click **Import data**.
-
-Formats:
-
-- `binlist`: headers such as `BIN, Brand, Type, Category, Issuer, IssuerPhone, IssuerUrl, isoCode2, isoCode3, CountryName`
-- `ranges`: headers such as `iin_start, iin_end, scheme, brand, type, country, bank_name`
-- `generic`: accepts the header aliases supported by both formats
-
-**Merge** adds new rows to the manual dataset and updates matching ranges. **Replace** atomically replaces only the manual dataset. Configured automatic sources are unaffected by either mode.
-
-The CSV is parsed into a temporary PostgreSQL table first. Invalid, empty, truncated, or oversized imports fail without deleting the currently working data. When an import succeeds, the transaction commits once and the lookup API immediately reads the new records.
-
-The manual source has higher lookup priority than automatic sources, so it can be used for corrections.
-
-### Check automatic sources now
-
-The **Check for updates** button on `/data` checks all configured GitHub sources immediately. Unchanged files are not downloaded again.
-
-## Automatic importing
-
-When `SYNC_ENABLED=true`, one background loop checks each configured GitHub CSV every `SYNC_INTERVAL` (five minutes by default):
-
-1. Read the latest commit for the configured file.
-2. Compare it with the commit stored in PostgreSQL.
-3. If unchanged, do nothing.
-4. If changed, download that exact version of the CSV.
-5. Parse and validate it in a temporary table.
-6. Replace that source's records in one transaction.
-
-If download, parsing, or validation fails, the previous imported records continue serving normally. Import status and errors are shown on `/data`.
-
-The built-in source is the CC BY 4.0 dataset at [`venelinkochev/bin-list-data`](https://github.com/venelinkochev/bin-list-data). Configure different sources with `SOURCES_FILE` or `SOURCES_JSON`; see [`config/sources.example.json`](config/sources.example.json).
+---
 
 ## Environment variables
 
+**Required**
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection URL |
+| `DATA_ADMIN_PASSWORD` | Protects `/data`; minimum 16 characters, and it must not be left as the example value |
+
+**Optional**
+
 | Variable | Default | Purpose |
 |---|---:|---|
-| `DATABASE_URL` | required | PostgreSQL connection URL |
-| `DATA_ADMIN_PASSWORD` | required | Protects `/data`; minimum 16 characters |
-| `HTTP_ADDR` | empty | Explicit HTTP listen address; overrides `PORT` |
-| `PORT` | `8080` | Hosting-provider port used when `HTTP_ADDR` is empty |
-| `SYNC_ENABLED` | `true` | Enable periodic GitHub checks |
+| `HTTP_ADDR` | empty | Explicit listen address; overrides `PORT` |
+| `PORT` | `8080` | Hosting-provider port, used when `HTTP_ADDR` is empty |
+| `SYNC_ENABLED` | `true` | Enable periodic upstream checks |
 | `SYNC_ON_START` | `true` | Check configured sources at startup |
 | `SYNC_INTERVAL` | `5m` | Check interval; minimum `30s` |
-| `GITHUB_TOKEN` | empty | Optional server-side token for GitHub API allowance |
-| `SOURCES_FILE` | empty | Path to source configuration JSON |
+| `GITHUB_TOKEN` | empty | Optional token to raise the GitHub API rate limit |
 | `SOURCES_JSON` | built-in source | Inline source configuration JSON |
-| `MAX_DOWNLOAD_BYTES` | `104857600` | Maximum automatic or manual CSV size; 1 MiB–1 GiB |
-| `MAX_INVALID_RATIO` | `0.05` | Maximum fraction of invalid CSV rows |
-| `DATABASE_MAX_CONNS` | `10` | PostgreSQL pool size |
+| `SOURCES_FILE` | empty | Path to a source configuration JSON file |
+| `MAX_DOWNLOAD_BYTES` | `104857600` | Maximum CSV size; must be 1 MiB–1 GiB |
+| `MAX_INVALID_RATIO` | `0.05` | Maximum fraction of invalid CSV rows tolerated |
+| `DATABASE_MAX_CONNS` | `10` | PostgreSQL pool size; minimum 2 |
 | `SHUTDOWN_TIMEOUT` | `15s` | Graceful shutdown deadline |
-| `TELEGRAM_CHANNEL_URL` | empty | Public website: Telegram channel link. Disabled placeholder when unset |
-| `DEVELOPER_TELEGRAM_URL` | empty | Public website: developer contact link. Disabled placeholder when unset |
+| `TELEGRAM_CHANNEL_URL` | empty | Website: official channel link |
+| `TELEGRAM_PRIVATE_URL` | empty | Website: private community invite link |
+| `DEVELOPER_TELEGRAM_URL` | empty | Website: developer contact link |
 
-Only one of `SOURCES_FILE` and `SOURCES_JSON` may be set. Docker Compose forwards `SOURCES_JSON`; use `SOURCES_FILE` only when that file is available inside the running container. Invalid booleans, durations, numbers, addresses, passwords, or unknown source fields stop startup with a clear error instead of silently using a default.
+Set only one of `SOURCES_FILE` and `SOURCES_JSON`. Invalid booleans, durations, numbers, addresses, passwords or unknown source fields stop startup with a clear error rather than silently falling back to a default.
 
-## Source configuration
+Telegram variables must be absolute `http(s)` URLs. While unset, the website renders a disabled button with a setup hint instead of a broken or invented link.
+
+### Source configuration
 
 ```json
 [
   {
     "id": "primary",
-    "repository": "community-owner/bin-data",
+    "repository": "owner/repository",
     "branch": "main",
     "path": "data/bins.csv",
     "format": "binlist",
@@ -242,17 +302,232 @@ Only one of `SOURCES_FILE` and `SOURCES_JSON` may be set. Docker Compose forward
 ]
 ```
 
-`repository` is a GitHub `owner/repository`. Source IDs cannot use the reserved ID `manual`. Automatic source priorities must be below `1000`; the manual source uses priority `1000` so admin corrections always win when records overlap.
+Supported `format` values are `binlist`, `ranges` and `generic`. Source IDs cannot use the reserved ID `manual`. Automatic source priorities must be below `1000`; the manual dataset uses priority `1000` so admin corrections always win when ranges overlap. See [`config/sources.example.json`](config/sources.example.json).
 
-## Development
+---
 
-Requires Go 1.24 and PostgreSQL 14 or newer.
+## Docker
+
+The repository ships a multi-stage `Dockerfile` producing a distroless, non-root image.
 
 ```bash
-go mod tidy
-go test -race ./...
-go vet ./...
-go build ./cmd/binapi
+docker build -t guison-api .
+
+docker run -d --name guison-api --restart unless-stopped -p 8080:8080 \
+  -e DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require' \
+  -e DATA_ADMIN_PASSWORD='a-unique-random-value-of-at-least-16-characters' \
+  guison-api
 ```
 
-The code is MIT licensed. Imported data retains its upstream license. No BIN dataset is committed to this repository.
+The container is stateless. **All persistent application data lives in PostgreSQL**, not on the container filesystem, so containers can be replaced or scaled freely. Only `/tmp` is used, for staging CSV downloads during import.
+
+---
+
+## Docker Compose
+
+Compose runs PostgreSQL and the API together — useful for local development.
+
+```bash
+cp .env.example .env
+# Set DATA_ADMIN_PASSWORD; Compose refuses to start without it.
+
+docker compose up --build
+```
+
+Compose supplies `DATABASE_URL` for its bundled PostgreSQL service automatically. You must provide `DATA_ADMIN_PASSWORD`. Everything else is optional and forwarded from your environment or `.env`, including the three Telegram variables. Database contents persist in the `postgres-data` volume.
+
+Stop with `docker compose down`, or `docker compose down -v` to also discard the database volume.
+
+---
+
+## Render deployment
+
+The project is Render-ready via the Docker runtime. Provision a PostgreSQL instance first (Render PostgreSQL or any external provider).
+
+### Option A — Web Service
+
+1. In Render choose **New → Web Service** and connect this repository.
+2. Select the **Docker** runtime; Render uses the root `Dockerfile` automatically.
+3. Add environment variables:
+   - `DATABASE_URL`
+   - `DATA_ADMIN_PASSWORD`
+   - optionally `TELEGRAM_CHANNEL_URL`, `TELEGRAM_PRIVATE_URL`, `DEVELOPER_TELEGRAM_URL`
+4. Set the health check path to **`/health`**.
+5. Deploy.
+
+### Option B — Blueprint
+
+Choose **New → Blueprint** and point Render at [`render.yaml`](render.yaml). It defines one Docker web service, sets `/health` as the health check, and prompts for the secrets. It does **not** provision a database — set `DATABASE_URL` yourself.
+
+### Notes
+
+- **Do not set `PORT`.** Render provides it and the application binds to it automatically.
+- Use **`/health`** for the platform health check. It is a cheap liveness probe that does not touch the database.
+- **Do not use `/readyz` as basic process health.** It reports whether a dataset is loaded and returns `503` during the first import, which would cause a healthy deploy to be marked failed. Use it for your own dataset-readiness checks instead.
+- Render terminates HTTPS before forwarding requests, which is what `/data` Basic Auth needs.
+
+After the first deploy, verify:
+
+```bash
+curl https://YOUR-SERVICE.onrender.com/health
+curl https://YOUR-SERVICE.onrender.com/readyz
+curl https://YOUR-SERVICE.onrender.com/45717360
+```
+
+---
+
+## Deploy anywhere
+
+There is no vendor lock-in. Guison runs on anything that provides Docker or a Linux Go runtime, a reachable PostgreSQL database, environment variables, and one HTTP port — a VPS with systemd, a container platform, Kubernetes, or a PaaS.
+
+The recipe is always the same:
+
+1. Build the container (or the Go binary)
+2. Set `DATABASE_URL`
+3. Set `DATA_ADMIN_PASSWORD`
+4. Expose the HTTP port — bind with `PORT` or `HTTP_ADDR`
+5. Point health checks at `/health`
+6. Serve it over HTTPS, especially if you use `/data`
+
+---
+
+## Administration
+
+`GET /data` is a protected administration interface. From it you can:
+
+- inspect dataset and per-source status, including record counts, last import time, current commit and last error
+- upload a manual CSV dataset
+- choose **merge** (add and update rows) or **replace** (atomically swap the manual dataset)
+- trigger an immediate check of all configured sources
+
+It is protected with **HTTP Basic authentication**: username `admin`, password from the server-side `DATA_ADMIN_PASSWORD` environment variable. The password is never rendered into the page HTML and there is no JavaScript on the page.
+
+**Always serve this over HTTPS in production** — Basic Auth credentials must be protected in transit. No credentials are published in this repository; set your own.
+
+Manual imports affect only the manual dataset, which carries priority `1000` so corrections win over automatic sources. Configured automatic sources are untouched by either mode.
+
+---
+
+## Data import & automatic sync
+
+```
+configured source
+  → check upstream commit (skip if unchanged)
+  → download that exact version
+  → streaming CSV parse
+  → temporary PostgreSQL staging table
+  → validation (row count, invalid-row ratio)
+  → transactional import
+  → lookup
+```
+
+When `SYNC_ENABLED=true`, one background loop checks each configured source every `SYNC_INTERVAL`. If the upstream commit is unchanged, nothing is downloaded.
+
+**Failed imports preserve previously working data.** If download, parsing or validation fails at any step, the transaction is never committed, the previously imported records keep serving, and the error is recorded and shown on `/data`.
+
+---
+
+## Project structure
+
+```
+.
+├── cmd/binapi/              # main entrypoint
+├── config/                  # example source configuration
+├── internal/
+│   ├── config/              # environment configuration and validation
+│   ├── database/            # PostgreSQL access, migrations, lookup query
+│   │   └── migrations/      # embedded schema
+│   ├── httpapi/             # HTTP routes, public website and docs
+│   │   └── assets/          # embedded CSS, JS and artwork
+│   ├── importer/            # CSV parsing and normalisation
+│   ├── model/               # shared response and status types
+│   └── syncer/              # GitHub polling and transactional import
+├── Dockerfile
+├── docker-compose.yml
+├── render.yaml
+└── Makefile
+```
+
+The public website is server-rendered by the Go application. CSS, JavaScript and artwork are embedded into the binary with `go:embed`, so there is no frontend build step, no npm and no separate deployment.
+
+---
+
+## Security
+
+Mechanisms implemented in this repository:
+
+- **Admin password is environment-only** — read from `DATA_ADMIN_PASSWORD`, never committed, never rendered into HTML
+- **`/data` uses HTTP Basic Auth** with constant-time credential comparison
+- **CSRF protection** — admin forms carry a server-generated token, validated in constant time
+- **Secure headers** — `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`; admin pages additionally send `Cache-Control: no-store`
+- **No secrets in public HTML** — the public site renders no credentials or environment values
+- **Public lookup requires no authentication**, and CORS is open only on non-admin routes
+- **Full card numbers are rejected** — input above 8 digits returns `400`
+- **Upload limits** — request bodies are capped and oversized uploads are rejected
+- **HTTPS is required in production** for `/data`, and recommended everywhere
+
+Please report security issues privately via the [developer contact](#community) rather than opening a public issue.
+
+---
+
+## Data source & credits
+
+Guison imports public BIN/IIN metadata from configured upstream sources. It does **not** claim ownership of that data.
+
+The current primary dataset is **[venelinkochev/bin-list-data](https://github.com/venelinkochev/bin-list-data)** by Venelin Kochev.
+
+- **Verified license:** Creative Commons Attribution 4.0 International (**CC BY 4.0**) — confirmed from the upstream repository's `LICENSE` file, its README, and GitHub's license metadata (`spdx_id: CC-BY-4.0`)
+- **Attribution requirement:** CC BY 4.0 requires crediting the original author and indicating that changes were made. Guison normalises the upstream CSV into integer range records and serves it as JSON — that is the modification.
+- If you redistribute data obtained from Guison, you must carry the same attribution.
+
+How the data is handled:
+
+- Guison automatically checks configured upstream sources for changes
+- Imports are validated in a staging table before replacing working data
+- A failed import leaves the previous dataset serving
+
+> **Accuracy disclaimer.** BIN/IIN information may be incomplete, outdated or inaccurate. This is community-maintained open data, not real-time payment network data. Do not treat Guison as authoritative payment verification, and do not use it as a sole fraud or compliance control.
+
+---
+
+## License
+
+The Guison API **source code** in this repository is released under the [MIT License](LICENSE).
+
+Imported BIN data retains its upstream license and is **not** covered by the MIT license — see [Data source & credits](#data-source--credits). No BIN dataset is committed to this repository.
+
+The website artwork in `internal/httpapi/assets/art/` was created for this project and ships under the same MIT license as the rest of the repository.
+
+---
+
+## Community
+
+- **[Official Telegram Channel](https://t.me/yorifederation)** — dataset updates, new endpoints and status notices
+- **[Private Community](https://t.me/+y8EekRvqpnQzNjZl)** — invite link for discussion and support
+- **[Contact the Developer](https://t.me/YorichiiPrime)** — integration questions and direct contact
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+For code changes:
+
+- keep the implementation lightweight
+- include tests for new behaviour
+- preserve existing API compatibility unless the change is intentional and described
+- avoid adding unnecessary dependencies
+- run `gofmt`, `go vet` and the test suite before opening a PR
+
+---
+
+## Testing
+
+```bash
+go test ./...              # run the test suite
+go test -race ./...        # run with the race detector (also: make test)
+go vet ./...               # static analysis
+go build ./cmd/binapi      # verify the binary builds
+gofmt -l .                 # list unformatted files; empty output means clean
+```
