@@ -1,0 +1,20 @@
+[
+  {
+    "id": "bin-list-data",
+    "repository": "venelinkochev/bin-list-data",
+    "branch": "master",
+    "path": "bin-list-data.csv",
+    "format": "binlist",
+    "priority": 100,
+    "min_records": 100000
+  },
+  {
+    "id": "iin-ranges",
+    "repository": "greendevilapps/iinlist",
+    "branch": "master",
+    "path": "ranges.csv",
+    "format": "ranges",
+    "priority": 50,
+    "min_records": 100
+  }
+]
