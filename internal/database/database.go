@@ -24,12 +24,12 @@ type DB struct {
 	Pool *pgxpool.Pool
 }
 
-func Open(ctx context.Context, databaseURL string, minConns, maxConns int32) (*DB, error) {
+func Open(ctx context.Context, databaseURL string, maxConns int32) (*DB, error) {
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
 	}
-	poolConfig.MinConns = minConns
+	poolConfig.MinConns = 1
 	poolConfig.MaxConns = maxConns
 	poolConfig.MaxConnLifetime = time.Hour
 	poolConfig.MaxConnIdleTime = 15 * time.Minute
@@ -60,13 +60,6 @@ func (db *DB) Migrate(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(684429910224831)`); err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
-	}
-	defer func() {
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(684429910224831)`)
-	}()
 
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return fmt.Errorf("create migration table: %w", err)
@@ -117,7 +110,8 @@ func (db *DB) ConfigureSources(ctx context.Context, sources []config.Source) err
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `UPDATE sources SET enabled=false, updated_at=now()`); err != nil {
+	// The manual source is managed from /data and must survive restarts.
+	if _, err := tx.Exec(ctx, `UPDATE sources SET enabled=false, updated_at=now() WHERE id <> 'manual'`); err != nil {
 		return err
 	}
 	for _, source := range sources {

@@ -11,8 +11,7 @@ import (
 	"time"
 )
 
-// Source describes one CSV file in a GitHub repository. Only GitHub repository
-// coordinates are accepted; arbitrary URLs are deliberately not supported.
+// Source describes one CSV file in a GitHub repository.
 type Source struct {
 	ID         string `json:"id"`
 	Repository string `json:"repository"`
@@ -24,22 +23,18 @@ type Source struct {
 }
 
 type Config struct {
-	HTTPAddr         string
-	DatabaseURL      string
-	GitHubToken      string
-	WebhookSecret    string
-	AdminToken       string
-	SyncEnabled      bool
-	SyncOnStart      bool
-	SyncInterval     time.Duration
-	MaxDownloadBytes int64
-	MaxInvalidRatio  float64
-	CacheTTL         time.Duration
-	CacheMaxEntries  int
-	ShutdownTimeout  time.Duration
-	DatabaseMaxConns int32
-	DatabaseMinConns int32
-	Sources          []Source
+	HTTPAddr          string
+	DatabaseURL       string
+	GitHubToken       string
+	DataAdminPassword string
+	SyncEnabled       bool
+	SyncOnStart       bool
+	SyncInterval      time.Duration
+	MaxDownloadBytes  int64
+	MaxInvalidRatio   float64
+	ShutdownTimeout   time.Duration
+	DatabaseMaxConns  int32
+	Sources           []Source
 }
 
 var (
@@ -49,25 +44,24 @@ var (
 
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:         env("HTTP_ADDR", ":8080"),
-		DatabaseURL:      strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		GitHubToken:      strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
-		WebhookSecret:    os.Getenv("GITHUB_WEBHOOK_SECRET"),
-		AdminToken:       os.Getenv("SYNC_ADMIN_TOKEN"),
-		SyncEnabled:      envBool("SYNC_ENABLED", true),
-		SyncOnStart:      envBool("SYNC_ON_START", true),
-		SyncInterval:     envDuration("SYNC_INTERVAL", 5*time.Minute),
-		MaxDownloadBytes: envInt64("MAX_DOWNLOAD_BYTES", 100<<20),
-		MaxInvalidRatio:  envFloat("MAX_INVALID_RATIO", 0.05),
-		CacheTTL:         envDuration("CACHE_TTL", 5*time.Minute),
-		CacheMaxEntries:  envInt("CACHE_MAX_ENTRIES", 100_000),
-		ShutdownTimeout:  envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
-		DatabaseMaxConns: int32(envInt("DATABASE_MAX_CONNS", 20)),
-		DatabaseMinConns: int32(envInt("DATABASE_MIN_CONNS", 2)),
+		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		DatabaseURL:       strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		GitHubToken:       strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
+		DataAdminPassword: os.Getenv("DATA_ADMIN_PASSWORD"),
+		SyncEnabled:       envBool("SYNC_ENABLED", true),
+		SyncOnStart:       envBool("SYNC_ON_START", true),
+		SyncInterval:      envDuration("SYNC_INTERVAL", 5*time.Minute),
+		MaxDownloadBytes:  envInt64("MAX_DOWNLOAD_BYTES", 100<<20),
+		MaxInvalidRatio:   envFloat("MAX_INVALID_RATIO", 0.05),
+		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
+		DatabaseMaxConns:  int32(envInt("DATABASE_MAX_CONNS", 10)),
 	}
 
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL is required")
+	}
+	if cfg.DataAdminPassword != "" && len(cfg.DataAdminPassword) < 16 {
+		return Config{}, errors.New("DATA_ADMIN_PASSWORD must be at least 16 characters when set")
 	}
 	if cfg.SyncInterval < 30*time.Second {
 		return Config{}, errors.New("SYNC_INTERVAL must be at least 30s")
@@ -78,11 +72,8 @@ func Load() (Config, error) {
 	if cfg.MaxInvalidRatio < 0 || cfg.MaxInvalidRatio > 1 {
 		return Config{}, errors.New("MAX_INVALID_RATIO must be between 0 and 1")
 	}
-	if cfg.CacheMaxEntries < 1 {
-		return Config{}, errors.New("CACHE_MAX_ENTRIES must be positive")
-	}
-	if cfg.DatabaseMaxConns < 2 || cfg.DatabaseMinConns < 0 || cfg.DatabaseMinConns > cfg.DatabaseMaxConns {
-		return Config{}, errors.New("invalid DATABASE_MIN_CONNS/DATABASE_MAX_CONNS")
+	if cfg.DatabaseMaxConns < 2 {
+		return Config{}, errors.New("DATABASE_MAX_CONNS must be at least 2")
 	}
 
 	sources, err := loadSources()
@@ -106,9 +97,6 @@ func loadSources() ([]Source, error) {
 		data = string(contents)
 	}
 	if data == "" {
-		// This is the most recently maintained, permissively licensed community
-		// dataset known when this service was created. It can be replaced without
-		// rebuilding the application by setting SOURCES_FILE.
 		data = `[{"id":"bin-list-data","repository":"venelinkochev/bin-list-data","branch":"master","path":"bin-list-data.csv","format":"binlist","priority":100,"min_records":100000}]`
 	}
 
@@ -136,8 +124,8 @@ func loadSources() ([]Source, error) {
 		if s.MinRecords == 0 {
 			s.MinRecords = 100
 		}
-		if !idPattern.MatchString(s.ID) {
-			return nil, fmt.Errorf("source %d has invalid id %q", i, s.ID)
+		if !idPattern.MatchString(s.ID) || s.ID == "manual" {
+			return nil, fmt.Errorf("source %d has invalid or reserved id %q", i, s.ID)
 		}
 		if !repoPattern.MatchString(s.Repository) {
 			return nil, fmt.Errorf("source %q has invalid repository %q", s.ID, s.Repository)

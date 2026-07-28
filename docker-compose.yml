@@ -20,10 +20,9 @@ services:
       DATABASE_URL: postgres://binapi:binapi@postgres:5432/binapi?sslmode=disable
       HTTP_ADDR: :8080
       SYNC_INTERVAL: 5m
-      # Set this in production to raise GitHub's server-side API allowance.
+      DATA_ADMIN_PASSWORD: ${DATA_ADMIN_PASSWORD:-}
+      # Optional: raises GitHub's server-side API allowance.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
-      SYNC_ADMIN_TOKEN: ${SYNC_ADMIN_TOKEN:-}
     ports:
       - "8080:8080"
     depends_on:

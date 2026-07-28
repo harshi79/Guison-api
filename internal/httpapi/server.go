@@ -2,83 +2,77 @@ package httpapi
 
 import (
 	"context"
-	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	_ "embed"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/harshi79/project-17/internal/database"
-	"github.com/harshi79/project-17/internal/lookup"
 	"github.com/harshi79/project-17/internal/model"
-	"github.com/harshi79/project-17/internal/syncer"
 )
 
-//go:embed openapi.yaml
-var openAPISpec []byte
-
 type DataStore interface {
+	Lookup(context.Context, string) (*model.LookupResult, error)
 	Stats(context.Context) (model.Stats, error)
 	Ready(context.Context) error
 }
 
-type Server struct {
-	lookup        *lookup.Service
-	store         DataStore
-	syncer        *syncer.Manager
-	webhookSecret string
-	adminToken    string
-	startedAt     time.Time
-	requests      atomic.Uint64
-	errors        atomic.Uint64
+type DataImporter interface {
+	CheckAll(context.Context) error
+	ImportUpload(context.Context, io.Reader, string, string, bool) (int64, error)
 }
 
-func New(lookupService *lookup.Service, store DataStore, manager *syncer.Manager, webhookSecret, adminToken string) *Server {
+type Server struct {
+	store         DataStore
+	importer      DataImporter
+	adminPassword string
+	csrfToken     string
+	maxUpload     int64
+	startedAt     time.Time
+	requests      atomic.Uint64
+	dataTemplate  *template.Template
+}
+
+func New(store DataStore, dataImporter DataImporter, adminPassword string, maxUpload int64) *Server {
 	return &Server{
-		lookup: lookupService, store: store, syncer: manager,
-		webhookSecret: webhookSecret, adminToken: adminToken, startedAt: time.Now(),
+		store: store, importer: dataImporter, adminPassword: adminPassword,
+		csrfToken: randomToken(), maxUpload: maxUpload, startedAt: time.Now(),
+		dataTemplate: template.Must(template.New("data").Parse(dataPageHTML)),
 	}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.home)
-	mux.HandleFunc("GET /openapi.yaml", s.openAPI)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
-	mux.HandleFunc("GET /v1/stats", s.stats)
-	mux.HandleFunc("GET /v1/bin/{iin}", s.lookupOne)
-	mux.HandleFunc("POST /v1/bins:lookup", s.lookupBatch)
-	mux.HandleFunc("POST /webhooks/github", s.githubWebhook)
-	mux.HandleFunc("POST /internal/sync", s.manualSync)
-	mux.HandleFunc("GET /metrics", s.metrics)
-	// Compatibility with binlist.net's GET /{iin} endpoint.
-	mux.HandleFunc("GET /{iin}", s.lookupOne)
+	mux.HandleFunc("GET /data", s.dataPage)
+	mux.HandleFunc("POST /data/import", s.dataImport)
+	mux.HandleFunc("POST /data/update", s.dataUpdate)
+	mux.HandleFunc("GET /v1/bin/{iin}", s.lookup)
+	mux.HandleFunc("GET /{iin}", s.lookup)
 	return s.middleware(mux)
 }
 
-func (s *Server) home(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) home(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Open BIN API", "version": "1.0.0", "rate_limit": nil,
-		"lookup": "/v1/bin/{6-8 digit IIN}", "openapi": "/openapi.yaml",
+		"name": "Open BIN API", "lookup": "/{6-8 digit BIN}", "admin": "/data",
 	})
-}
-
-func (s *Server) openAPI(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
-	_, _ = w.Write(openAPISpec)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -95,19 +89,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	stats, err := s.store.Stats(ctx)
-	if err != nil {
-		s.internalError(w, err)
-		return
-	}
-	w.Header().Set("Cache-Control", "public, max-age=60")
-	writeJSON(w, http.StatusOK, stats)
-}
-
-func (s *Server) lookupOne(w http.ResponseWriter, r *http.Request) {
+func (s *Server) lookup(w http.ResponseWriter, r *http.Request) {
 	iin := r.PathValue("iin")
 	if _, _, err := database.NormalizeQuery(iin); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_iin", err.Error())
@@ -115,203 +97,156 @@ func (s *Server) lookupOne(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	result, err := s.lookup.Lookup(ctx, iin)
+	result, err := s.store.Lookup(ctx, iin)
 	if err != nil {
 		s.internalError(w, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	if result == nil {
-		w.Header().Set("Cache-Control", "public, max-age=60")
-		writeError(w, http.StatusNotFound, "not_found", "No record covers this IIN")
-		return
-	}
-	etag := makeETag(result)
-	w.Header().Set("ETag", etag)
-	w.Header().Set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400")
-	if r.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
+		writeError(w, http.StatusNotFound, "not_found", "No record covers this BIN/IIN")
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
-type batchRequest struct {
-	BINs []string `json:"bins"`
+func (s *Server) dataPage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	s.renderDataPage(w, r, http.StatusOK, r.URL.Query().Get("message"), "")
 }
 
-type batchItem struct {
-	IIN    string              `json:"iin"`
-	Found  bool                `json:"found"`
-	Result *model.LookupResult `json:"result"`
-}
-
-func (s *Server) lookupBatch(w http.ResponseWriter, r *http.Request) {
-	var input batchRequest
-	if err := decodeJSON(w, r, &input, 64<<10); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+func (s *Server) dataImport(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
-	if len(input.BINs) < 1 || len(input.BINs) > 1000 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "bins must contain between 1 and 1000 items")
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxUpload+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		s.renderDataPage(w, r, http.StatusBadRequest, "", "The upload is too large or the form is invalid.")
 		return
 	}
-	for _, iin := range input.BINs {
-		if _, _, err := database.NormalizeQuery(iin); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_iin", fmt.Sprintf("%q: %s", iin, err))
-			return
-		}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	if !s.validCSRF(r.FormValue("csrf_token")) {
+		s.renderDataPage(w, r, http.StatusForbidden, "", "The form expired. Reload /data and try again.")
+		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-	items := make([]batchItem, len(input.BINs))
-	semaphore := make(chan struct{}, 20)
-	var wg sync.WaitGroup
-	var firstErr error
-	var errMu sync.Mutex
-	for index, iin := range input.BINs {
-		index, iin := index, iin
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				return
-			}
-			result, err := s.lookup.Lookup(ctx, iin)
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-				cancel()
-				return
-			}
-			items[index] = batchItem{IIN: iin, Found: result != nil, Result: result}
-		}()
-	}
-	wg.Wait()
-	if firstErr != nil {
-		s.internalError(w, firstErr)
-		return
-	}
-	if err := ctx.Err(); err != nil {
-		s.internalError(w, err)
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{"results": items})
-}
-
-func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.syncer == nil || s.webhookSecret == "" {
-		writeError(w, http.StatusServiceUnavailable, "webhook_not_configured", "GitHub webhook sync is not configured")
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
+	file, header, err := r.FormFile("dataset")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "Webhook body is too large or unreadable")
+		s.renderDataPage(w, r, http.StatusBadRequest, "", "Choose a CSV file to import.")
 		return
 	}
-	if !verifyGitHubSignature(body, r.Header.Get("X-Hub-Signature-256"), s.webhookSecret) {
-		writeError(w, http.StatusUnauthorized, "invalid_signature", "Invalid GitHub webhook signature")
+	defer file.Close()
+	format := r.FormValue("format")
+	replace := r.FormValue("mode") == "replace"
+	records, err := s.importer.ImportUpload(r.Context(), file, header.Filename, format, replace)
+	if err != nil {
+		s.renderDataPage(w, r, http.StatusBadRequest, "", "Import failed: "+err.Error())
 		return
 	}
-	switch r.Header.Get("X-GitHub-Event") {
-	case "ping":
-		writeJSON(w, http.StatusOK, map[string]string{"status": "pong"})
-		return
-	case "push":
-	default:
-		writeJSON(w, http.StatusAccepted, map[string]any{"queued": []string{}})
-		return
-	}
-	var event struct {
-		Ref        string `json:"ref"`
-		Repository struct {
-			FullName string `json:"full_name"`
-		} `json:"repository"`
-		Commits []struct {
-			Added    []string `json:"added"`
-			Modified []string `json:"modified"`
-			Removed  []string `json:"removed"`
-		} `json:"commits"`
-	}
-	if err := json.Unmarshal(body, &event); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid webhook JSON")
-		return
-	}
-	changed := make(map[string]bool)
-	for _, commit := range event.Commits {
-		for _, file := range append(append(commit.Added, commit.Modified...), commit.Removed...) {
-			changed[file] = true
-		}
-	}
-	ids := s.syncer.SourcesForRepository(event.Repository.FullName, event.Ref, changed)
-	queued := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if s.syncer.Trigger(id) {
-			queued = append(queued, id)
-		}
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"queued": queued})
+	message := fmt.Sprintf("Import complete. The manual dataset now contains %d records.", records)
+	http.Redirect(w, r, "/data?message="+url.QueryEscape(message), http.StatusSeeOther)
 }
 
-func (s *Server) manualSync(w http.ResponseWriter, r *http.Request) {
-	if s.syncer == nil || s.adminToken == "" {
-		writeError(w, http.StatusNotFound, "not_found", "Not found")
+func (s *Server) dataUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
-	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if subtle.ConstantTimeCompare([]byte(provided), []byte(s.adminToken)) != 1 {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "A valid bearer token is required")
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		s.renderDataPage(w, r, http.StatusBadRequest, "", "Invalid form submission.")
 		return
 	}
-	var input struct {
-		Source string `json:"source"`
-	}
-	if err := decodeJSON(w, r, &input, 4<<10); err != nil && !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+	if !s.validCSRF(r.FormValue("csrf_token")) {
+		s.renderDataPage(w, r, http.StatusForbidden, "", "The form expired. Reload /data and try again.")
 		return
 	}
-	if input.Source == "" {
-		s.syncer.TriggerAll()
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "all sources queued"})
+	if err := s.importer.CheckAll(r.Context()); err != nil {
+		s.renderDataPage(w, r, http.StatusBadGateway, "", "Automatic source check failed: "+err.Error())
 		return
 	}
-	if !s.syncer.Trigger(input.Source) {
-		writeError(w, http.StatusNotFound, "unknown_source", "Unknown source id")
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "source queued", "source": input.Source})
+	http.Redirect(w, r, "/data?message="+url.QueryEscape("Configured sources are up to date."), http.StatusSeeOther)
 }
 
-func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
-	hits, misses, entries := s.lookup.Metrics()
-	stats, _ := s.store.Stats(r.Context())
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "# HELP open_bin_http_requests_total HTTP requests handled.\n# TYPE open_bin_http_requests_total counter\nopen_bin_http_requests_total %d\n", s.requests.Load())
-	_, _ = fmt.Fprintf(w, "# HELP open_bin_http_errors_total HTTP 5xx responses.\n# TYPE open_bin_http_errors_total counter\nopen_bin_http_errors_total %d\n", s.errors.Load())
-	_, _ = fmt.Fprintf(w, "# TYPE open_bin_cache_hits_total counter\nopen_bin_cache_hits_total %d\n# TYPE open_bin_cache_misses_total counter\nopen_bin_cache_misses_total %d\n", hits, misses)
-	_, _ = fmt.Fprintf(w, "# TYPE open_bin_cache_entries gauge\nopen_bin_cache_entries %d\n# TYPE open_bin_records gauge\nopen_bin_records %d\n", entries, stats.Records)
+func (s *Server) renderDataPage(w http.ResponseWriter, r *http.Request, status int, message, errorMessage string) {
+	setAdminHeaders(w)
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	stats, err := s.store.Stats(ctx)
+	if err != nil {
+		http.Error(w, "Could not read dataset status", http.StatusInternalServerError)
+		return
+	}
+	view := struct {
+		CSRF    string
+		Message string
+		Error   string
+		Stats   model.Stats
+	}{s.csrfToken, message, errorMessage, stats}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	if err := s.dataTemplate.Execute(w, view); err != nil {
+		slog.Error("render data page", "error", err)
+	}
+}
+
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	setAdminHeaders(w)
+	if s.adminPassword == "" {
+		http.Error(w, "Set DATA_ADMIN_PASSWORD to enable this page.", http.StatusServiceUnavailable)
+		return false
+	}
+	username, password, ok := r.BasicAuth()
+	providedPassword := sha256.Sum256([]byte(password))
+	expectedPassword := sha256.Sum256([]byte(s.adminPassword))
+	validUser := subtle.ConstantTimeCompare([]byte(username), []byte("admin")) == 1
+	validPassword := subtle.ConstantTimeCompare(providedPassword[:], expectedPassword[:]) == 1
+	if !ok || !validUser || !validPassword {
+		w.Header().Set("WWW-Authenticate", `Basic realm="BIN data admin", charset="UTF-8"`)
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func (s *Server) validCSRF(provided string) bool {
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.csrfToken)) == 1
+}
+
+func setAdminHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+func randomToken() string {
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		panic("could not create CSRF token: " + err.Error())
+	}
+	return hex.EncodeToString(value)
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		s.requests.Add(1)
+		requestNumber := s.requests.Add(1)
 		requestID := r.Header.Get("X-Request-ID")
 		if requestID == "" || len(requestID) > 128 {
-			requestID = strconv.FormatUint(s.requests.Load(), 36) + "-" + strconv.FormatInt(started.UnixNano(), 36)
+			requestID = strconv.FormatUint(requestNumber, 36) + "-" + strconv.FormatInt(started.UnixNano(), 36)
 		}
 		w.Header().Set("X-Request-ID", requestID)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, If-None-Match, X-Request-ID, X-Hub-Signature-256, X-GitHub-Event")
+		if !strings.HasPrefix(r.URL.Path, "/data") {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Request-ID")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -319,7 +254,6 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		wrapped := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				s.errors.Add(1)
 				slog.Error("panic recovered", "request_id", requestID, "error", recovered)
 				if !wrapped.wroteHeader {
 					writeError(wrapped, http.StatusInternalServerError, "internal_error", "An internal error occurred")
@@ -333,7 +267,6 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) internalError(w http.ResponseWriter, err error) {
-	s.errors.Add(1)
 	slog.Error("request failed", "error", err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred")
 }
@@ -360,36 +293,6 @@ func (w *statusWriter) Write(body []byte) (int, error) {
 	return w.ResponseWriter.Write(body)
 }
 
-func verifyGitHubSignature(body []byte, signature, secret string) bool {
-	if !strings.HasPrefix(signature, "sha256=") {
-		return false
-	}
-	provided, err := hex.DecodeString(strings.TrimPrefix(signature, "sha256="))
-	if err != nil {
-		return false
-	}
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write(body)
-	return hmac.Equal(provided, mac.Sum(nil))
-}
-
-func makeETag(result *model.LookupResult) string {
-	sum := sha256.Sum256([]byte(result.IIN + "\x00" + result.Match.Start + "\x00" + result.Match.End + "\x00" + result.Source.Commit))
-	return `"` + hex.EncodeToString(sum[:12]) + `"`
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, target any, limit int64) error {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain one JSON value")
-	}
-	return nil
-}
-
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -399,3 +302,75 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
 }
+
+const dataPageHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BIN data</title>
+  <style>
+    body{font:16px/1.5 system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#17202a;background:#f7f8fa}
+    h1,h2{line-height:1.2}section{background:white;border:1px solid #dde2e7;border-radius:10px;padding:1.25rem;margin:1rem 0}
+    label{display:block;font-weight:600;margin:.8rem 0 .3rem}input,select,button{font:inherit}input[type=file],select{width:100%;max-width:520px;padding:.55rem}
+    button{margin-top:1rem;padding:.65rem 1rem;border:0;border-radius:6px;background:#1769aa;color:white;cursor:pointer}.muted{color:#59636e}
+    .ok,.error{padding:.8rem;border-radius:6px}.ok{background:#e8f6ec;color:#175c2c}.error{background:#fdecec;color:#8a1f1f}
+    table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #e5e8eb;vertical-align:top;word-break:break-word}
+    code{font-size:.85em}fieldset{border:0;padding:0;margin:0}label.inline{display:inline;font-weight:400;margin-right:1rem}
+  </style>
+</head>
+<body>
+  <h1>BIN data</h1>
+  <p class="muted">Import CSV data and check configured GitHub datasets. Existing data stays live until a complete import succeeds.</p>
+  {{if .Message}}<p class="ok">{{.Message}}</p>{{end}}
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+
+  <section>
+    <h2>Import CSV</h2>
+    <form method="post" action="/data/import" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <label for="dataset">CSV file</label>
+      <input id="dataset" name="dataset" type="file" accept=".csv,text/csv" required>
+      <label for="format">CSV format</label>
+      <select id="format" name="format">
+        <option value="binlist">BIN list (BIN, Brand, Type, Category, Issuer...)</option>
+        <option value="ranges">Ranges (iin_start, iin_end, scheme, bank_name...)</option>
+        <option value="generic">Generic header aliases</option>
+      </select>
+      <label>Import mode</label>
+      <fieldset>
+        <label class="inline"><input type="radio" name="mode" value="merge" checked> Merge with manual data</label>
+        <label class="inline"><input type="radio" name="mode" value="replace"> Replace manual data</label>
+      </fieldset>
+      <button type="submit">Import data</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Automatic sources</h2>
+    <p class="muted">The server checks these sources periodically. Use this button to check them now.</p>
+    <form method="post" action="/data/update">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <button type="submit">Check for updates</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Status</h2>
+    <p><strong>{{.Stats.Records}}</strong> imported records across active sources.</p>
+    <table>
+      <thead><tr><th>Source</th><th>Status</th><th>Records</th><th>Last import</th><th>Details</th></tr></thead>
+      <tbody>
+      {{range .Stats.Sources}}
+        <tr>
+          <td><strong>{{.ID}}</strong><br><span class="muted">{{.Repository}} / {{.Path}}</span></td>
+          <td>{{.Status}}</td><td>{{.RecordCount}}</td><td>{{if .LastSyncedAt}}{{.LastSyncedAt}}{{else}}Never{{end}}</td>
+          <td>{{if .LastError}}<span class="error">{{.LastError}}</span>{{else if .CurrentCommit}}<code>{{.CurrentCommit}}</code>{{else}}—{{end}}</td>
+        </tr>
+      {{else}}<tr><td colspan="5">No sources configured.</td></tr>{{end}}
+      </tbody>
+    </table>
+  </section>
+  <p class="muted">This page uses HTTP Basic authentication with username <code>admin</code>. Serve it over HTTPS.</p>
+</body>
+</html>`
