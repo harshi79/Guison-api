@@ -31,6 +31,18 @@ func (f *fakeStore) Lookup(_ context.Context, iin string) (*model.LookupResult, 
 func (f *fakeStore) Stats(context.Context) (model.Stats, error) { return f.stats, nil }
 func (f *fakeStore) Ready(context.Context) error                { return nil }
 
+type panicStore struct{}
+
+func (*panicStore) Lookup(context.Context, string) (*model.LookupResult, error) {
+	panic("health endpoint queried lookup storage")
+}
+func (*panicStore) Stats(context.Context) (model.Stats, error) {
+	panic("health endpoint queried stats storage")
+}
+func (*panicStore) Ready(context.Context) error {
+	panic("health endpoint queried readiness storage")
+}
+
 type fakeImporter struct {
 	called  bool
 	format  string
@@ -43,6 +55,22 @@ func (f *fakeImporter) ImportUpload(_ context.Context, reader io.Reader, _ strin
 	data, _ := io.ReadAll(reader)
 	f.called, f.format, f.replace, f.content = true, format, replace, string(data)
 	return 3, nil
+}
+
+func TestUptimeHealthDoesNotUseDependencies(t *testing.T) {
+	handler := New(&panicStore{}, &fakeImporter{}, "secret", 1<<20).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Body.String() != "OK\n" {
+		t.Fatalf("body=%q, want OK", response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Fatalf("Content-Type=%q", got)
+	}
 }
 
 func TestLookup(t *testing.T) {

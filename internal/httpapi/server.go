@@ -55,6 +55,7 @@ func New(store DataStore, dataImporter DataImporter, adminPassword string, maxUp
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.home)
+	mux.HandleFunc("GET /health", s.uptimeHealth)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /data", s.dataPage)
@@ -73,6 +74,13 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Open BIN API", "lookup": "/{6-8 digit BIN}", "admin": "/data",
 	})
+}
+
+func (s *Server) uptimeHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "OK\n")
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {

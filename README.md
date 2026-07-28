@@ -6,6 +6,7 @@ A small Go + PostgreSQL service for looking up BIN/IIN information and keeping t
 
 - Public BIN lookup: `GET /{bin}`
 - Alternative lookup route: `GET /v1/bin/{bin}`
+- Lightweight uptime endpoint: `GET /health`
 - Password-protected data page: `GET /data`
 - Manual CSV upload with merge or replace mode
 - Periodic import from configured GitHub CSV files
@@ -73,6 +74,48 @@ On a fresh database the application:
 `/healthz` returns `200` once the HTTP process is running. `/readyz` returns `503` until at least one usable dataset has committed. A GitHub failure leaves the process running and readiness false on a fresh database; the error is visible in logs and on `/data`. When the database already contains usable records, a later GitHub failure leaves those records online and readiness stays true.
 
 PostgreSQL connection or migration failures stop startup with a non-zero exit and a clear log message. This is intentional: the API never pretends to be healthy without its database.
+
+## Deploy on Render
+
+The repository is ready for a Render **Web Service** using the Docker runtime. Render builds the Go binary inside Docker; no Go installation or build command is needed on Render.
+
+1. Push or select this GitHub repository and branch.
+2. In Render, choose **New → Web Service**.
+3. Connect the repository.
+4. Select **Docker** as the runtime. Render uses the root `Dockerfile` automatically.
+5. Add these environment variables:
+
+   ```text
+   DATABASE_URL=<your hosted PostgreSQL connection URL>
+   DATA_ADMIN_PASSWORD=<a unique random value of at least 16 characters>
+   ```
+
+6. Set the health check path to `/health` under the service's advanced settings.
+7. Deploy. Do not set `PORT`; Render provides it and the application binds to `0.0.0.0:$PORT` automatically.
+8. Open `https://YOUR-SERVICE.onrender.com/health` and expect `OK` with HTTP `200`.
+9. Wait for `https://YOUR-SERVICE.onrender.com/readyz` to return HTTP `200` after the first import.
+10. Test `https://YOUR-SERVICE.onrender.com/45717360`.
+11. Open `https://YOUR-SERVICE.onrender.com/data` and sign in with username `admin` and `DATA_ADMIN_PASSWORD`.
+
+A minimal [`render.yaml`](render.yaml) is included for users who prefer **New → Blueprint**. It creates one Docker web service, sets `/health` as Render's health check, and prompts for the two required secrets. It does not provision a database; set `DATABASE_URL` to your external or Render PostgreSQL connection string.
+
+Render terminates public HTTPS before forwarding requests to the container. `/data` uses same-origin form actions and standard Basic Auth, so it does not need a Render-specific hostname or proxy configuration.
+
+### UptimeRobot
+
+Create an **HTTP(S)** monitor with this URL:
+
+```text
+https://YOUR-SERVICE.onrender.com/health
+```
+
+Expect HTTP `200`. This endpoint returns only `OK`; it does not query PostgreSQL, contact GitHub, check dataset readiness, trigger imports, or require authentication. Continue using `/readyz` separately when you need to know whether BIN data is available.
+
+Health endpoint meanings:
+
+- `/health`: minimal process-liveness response for Render and UptimeRobot.
+- `/healthz`: application process health with uptime information; no database query.
+- `/readyz`: queries PostgreSQL and returns `200` only when at least one usable dataset exists.
 
 ## Lookup API
 

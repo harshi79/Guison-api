@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: open-bin-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DATA_ADMIN_PASSWORD
+        sync: false
