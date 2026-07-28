@@ -195,9 +195,13 @@ h3 { font-size: 1.12rem; }
 .stat span { font-size: 0.82rem; color: var(--muted); }
 
 .hero-art { position: relative; }
+/* The artwork is generated on the exact page background (--bg) and its edges are
+   faded through a mask, so it merges into the page instead of sitting in a box. */
 .hero-art img {
-  width: 100%; border-radius: 18px; border: 1px solid var(--line);
+  width: 100%; height: auto; display: block;
   filter: drop-shadow(0 0 46px rgba(180, 255, 46, 0.14));
+  mask-image: radial-gradient(120% 108% at 68% 50%, #000 52%, transparent 96%);
+  -webkit-mask-image: radial-gradient(120% 108% at 68% 50%, #000 52%, transparent 96%);
 }
 .hero-art::after {
   content: ""; position: absolute; inset: -14%; z-index: -1; border-radius: 50%;
@@ -363,8 +367,14 @@ code:not(pre code) {
 .ep-desc { color: var(--muted); font-size: 0.88rem; }
 
 /* ---------- Divider art ---------- */
-.divider-art { position: relative; margin: 0; padding: 0; overflow: hidden; line-height: 0; }
-.divider-art img { width: 100%; opacity: 0.5; mask-image: linear-gradient(to bottom, transparent, #000 32%, #000 68%, transparent); -webkit-mask-image: linear-gradient(to bottom, transparent, #000 32%, #000 68%, transparent); }
+.divider-art { position: relative; margin: 0 auto; padding: 0; overflow: hidden; line-height: 0; max-width: 980px; }
+/* Holds a character illustration, so the fade only softens the outer edges and
+   never crops the character. Edges dissolve into the page background. */
+.divider-art img {
+  width: 100%; height: auto; display: block; opacity: 0.9;
+  mask-image: radial-gradient(96% 116% at 50% 50%, #000 56%, transparent 97%);
+  -webkit-mask-image: radial-gradient(96% 116% at 50% 50%, #000 56%, transparent 97%);
+}
 
 /* ---------- Telegram ---------- */
 .tg-wrap {
@@ -391,7 +401,12 @@ code:not(pre code) {
 /* ---------- FAQ ---------- */
 .faq-layout { display: grid; grid-template-columns: 1fr 300px; gap: 44px; align-items: start; }
 .faq-art { position: relative; position: sticky; top: 110px; }
-.faq-art img { width: 100%; border-radius: var(--radius); opacity: 0.94; filter: drop-shadow(0 0 32px rgba(180, 255, 46, 0.14)); }
+.faq-art img {
+  width: 100%; height: auto; display: block; opacity: 0.94;
+  filter: drop-shadow(0 0 32px rgba(180, 255, 46, 0.14));
+  mask-image: radial-gradient(118% 112% at 50% 52%, #000 54%, transparent 95%);
+  -webkit-mask-image: radial-gradient(118% 112% at 50% 52%, #000 54%, transparent 95%);
+}
 
 .faq-list { display: flex; flex-direction: column; gap: 10px; }
 details.faq {
@@ -487,9 +502,21 @@ table.api td:first-child { color: var(--text); font-family: var(--mono); font-si
 /* ---------- Responsive ---------- */
 @media (max-width: 980px) {
   .hero-grid { grid-template-columns: 1fr; gap: 40px; }
-  .hero-art { max-width: 440px; margin: 0 auto; order: -1; }
+  /* Stacked hero: crop the empty desktop text-space out of the artwork so the
+     mascot stays large and readable instead of shrinking to a thumbnail. */
+  .hero-art {
+    max-width: 440px; margin: 0 auto; order: -1;
+    aspect-ratio: 5 / 4; overflow: hidden;
+  }
+  .hero-art img {
+    width: 100%; height: 100%; object-fit: cover; object-position: 74% 42%;
+    mask-image: radial-gradient(112% 106% at 52% 48%, #000 58%, transparent 97%);
+    -webkit-mask-image: radial-gradient(112% 106% at 52% 48%, #000 58%, transparent 97%);
+  }
   .faq-layout { grid-template-columns: 1fr; }
   .faq-art { display: none; }
+  /* Keep the divider character legible without dominating narrow screens. */
+  .divider-art { max-width: 520px; }
   .docs-layout { grid-template-columns: 1fr; gap: 26px; padding-top: 26px; }
   .toc { position: static; max-height: none; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
   .toc ul { flex-direction: row; flex-wrap: wrap; gap: 5px; }

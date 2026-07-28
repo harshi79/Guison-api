@@ -29,7 +29,7 @@ const homeHTML = `
       </div>
     </div>
     <div class="hero-art">
-      <img src="/assets/art/hero.webp" width="900" height="514" alt="" role="presentation" fetchpriority="high" decoding="async">
+      <img src="/assets/art/hero.webp" width="1600" height="913" alt="" role="presentation" fetchpriority="high" decoding="async">
     </div>
   </div>
 </section>
@@ -126,7 +126,7 @@ const homeHTML = `
 </section>
 
 <div class="divider-art" aria-hidden="true">
-  <img src="/assets/art/divider.webp" width="1400" height="750" alt="" loading="lazy" decoding="async">
+  <img src="/assets/art/divider.webp" width="1600" height="857" alt="" loading="lazy" decoding="async">
 </div>
 
 <section class="section" id="endpoints" style="padding-top:26px">
@@ -301,7 +301,7 @@ const homeHTML = `
         </details>
       </div>
       <aside class="faq-art" aria-hidden="true">
-        <img src="/assets/art/faq.webp" width="460" height="276" alt="" loading="lazy" decoding="async">
+        <img src="/assets/art/faq.webp" width="920" height="552" alt="" loading="lazy" decoding="async">
       </aside>
     </div>
   </div>
