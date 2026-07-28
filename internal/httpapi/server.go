@@ -55,6 +55,8 @@ func New(store DataStore, dataImporter DataImporter, adminPassword string, maxUp
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.home)
+	mux.HandleFunc("GET /docs", s.docsPage)
+	mux.Handle("GET /assets/", staticAssets())
 	mux.HandleFunc("GET /health", s.uptimeHealth)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
@@ -67,13 +69,12 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) home(w http.ResponseWriter, r *http.Request) {
+	// "GET /" is also the fallback for unmatched multi-segment paths.
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Open BIN API", "lookup": "/{6-8 digit BIN}", "admin": "/data",
-	})
+	s.homePage(w, r)
 }
 
 func (s *Server) uptimeHealth(w http.ResponseWriter, _ *http.Request) {

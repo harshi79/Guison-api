@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -231,3 +232,14 @@ func newUploadRequest(t *testing.T, csrfToken, mode string) *http.Request {
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	return request
 }
+
+// errorStore fails every query so page degradation can be exercised.
+type errorStore struct{}
+
+func (*errorStore) Lookup(context.Context, string) (*model.LookupResult, error) {
+	return nil, errors.New("database unavailable")
+}
+func (*errorStore) Stats(context.Context) (model.Stats, error) {
+	return model.Stats{}, errors.New("database unavailable")
+}
+func (*errorStore) Ready(context.Context) error { return errors.New("database unavailable") }
