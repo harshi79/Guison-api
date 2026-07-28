@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,24 +19,27 @@ import (
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	if err := run(); err != nil {
+		slog.Error("application stopped", "error", err)
+		os.Exit(1)
+	}
+}
 
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("invalid configuration", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	db, err := database.Open(ctx, cfg.DatabaseURL, cfg.DatabaseMaxConns)
 	if err != nil {
-		slog.Error("database startup failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("database startup: %w", err)
 	}
 	defer db.Close()
 	if err := db.ConfigureSources(ctx, cfg.Sources); err != nil {
-		slog.Error("source configuration failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("configure sources: %w", err)
 	}
 
 	github := syncer.NewGitHubClient(cfg.GitHubToken, cfg.MaxDownloadBytes)
@@ -54,18 +58,35 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
 	}
+	serveErrors := make(chan error, 1)
 	go func() {
 		slog.Info("API listening", "address", cfg.HTTPAddr, "automatic_import", cfg.SyncEnabled)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("HTTP server failed", "error", err)
-			stop()
-		}
+		serveErrors <- server.ListenAndServe()
 	}()
 
-	<-ctx.Done()
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case err := <-serveErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			serveErr = fmt.Errorf("HTTP server: %w", err)
+		}
+		stop()
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("HTTP shutdown failed", "error", err)
+	shutdownErr := server.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		_ = server.Close()
 	}
+	dataImporter.Wait()
+
+	if serveErr != nil {
+		return serveErr
+	}
+	if shutdownErr != nil {
+		return fmt.Errorf("HTTP shutdown: %w", shutdownErr)
+	}
+	return nil
 }

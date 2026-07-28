@@ -90,6 +90,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	iin := r.PathValue("iin")
 	if _, _, err := database.NormalizeQuery(iin); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_iin", err.Error())
@@ -102,7 +103,6 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
 	if result == nil {
 		writeError(w, http.StatusNotFound, "not_found", "No record covers this BIN/IIN")
 		return
@@ -141,7 +141,16 @@ func (s *Server) dataImport(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	format := r.FormValue("format")
-	replace := r.FormValue("mode") == "replace"
+	if format != "binlist" && format != "ranges" && format != "generic" {
+		s.renderDataPage(w, r, http.StatusBadRequest, "", "Choose a supported CSV format.")
+		return
+	}
+	mode := r.FormValue("mode")
+	if mode != "merge" && mode != "replace" {
+		s.renderDataPage(w, r, http.StatusBadRequest, "", "Choose merge or replace import mode.")
+		return
+	}
+	replace := mode == "replace"
 	records, err := s.importer.ImportUpload(r.Context(), file, header.Filename, format, replace)
 	if err != nil {
 		s.renderDataPage(w, r, http.StatusBadRequest, "", "Import failed: "+err.Error())

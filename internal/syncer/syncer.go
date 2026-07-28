@@ -38,6 +38,7 @@ type Manager struct {
 	maxInvalidRatio  float64
 	maxDownloadBytes int64
 	mu               sync.Mutex
+	wg               sync.WaitGroup
 }
 
 func New(pool *pgxpool.Pool, github *GitHubClient, sources []config.Source, interval time.Duration, maxInvalidRatio float64, maxDownloadBytes int64) *Manager {
@@ -49,7 +50,9 @@ func New(pool *pgxpool.Pool, github *GitHubClient, sources []config.Source, inte
 
 // Run starts one simple periodic loop. There are no queues or separate workers.
 func (m *Manager) Run(ctx context.Context, importOnStart bool) {
+	m.wg.Add(1)
 	go func() {
+		defer m.wg.Done()
 		if importOnStart {
 			m.checkAllAndLog(ctx)
 		}
@@ -64,6 +67,11 @@ func (m *Manager) Run(ctx context.Context, importOnStart bool) {
 			}
 		}
 	}()
+}
+
+// Wait blocks until the automatic loop has stopped after its context is canceled.
+func (m *Manager) Wait() {
+	m.wg.Wait()
 }
 
 func (m *Manager) checkAllAndLog(ctx context.Context) {
@@ -198,16 +206,22 @@ func (m *Manager) importFile(ctx context.Context, source config.Source, commit C
 	if err != nil {
 		return 0, err
 	}
-	copied, err := tx.CopyFrom(ctx, pgx.Identifier{"staging_records"}, copyColumns, parser)
-	if err != nil {
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staging_records"}, copyColumns, parser); err != nil {
 		return 0, fmt.Errorf("copy source data: %w", err)
-	}
-	if copied < int64(source.MinRecords) {
-		return 0, fmt.Errorf("import has %d valid records; at least %d required", copied, source.MinRecords)
 	}
 	if parser.TotalRows() > 0 && float64(parser.InvalidRows())/float64(parser.TotalRows()) > m.maxInvalidRatio {
 		return 0, fmt.Errorf("%d of %d rows are invalid; maximum is %.2f%%",
 			parser.InvalidRows(), parser.TotalRows(), m.maxInvalidRatio*100)
+	}
+	var stagedCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM (
+			SELECT 1 FROM staging_records GROUP BY source_id, iin_start, iin_end
+		) AS unique_records`).Scan(&stagedCount); err != nil {
+		return 0, fmt.Errorf("count staged records: %w", err)
+	}
+	if stagedCount < int64(source.MinRecords) {
+		return 0, fmt.Errorf("import has %d unique valid records; at least %d required", stagedCount, source.MinRecords)
 	}
 
 	if replace {

@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -51,17 +52,29 @@ func TestLookup(t *testing.T) {
 	}}
 	handler := New(store, &fakeImporter{}, "secret", 1<<20).Handler()
 
-	request := httptest.NewRequest(http.MethodGet, "/45717360", nil)
+	for _, path := range []string{"/45717360", "/v1/bin/45717360"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("path=%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `"iin":"45717360"`) {
+			t.Fatalf("path=%s unexpected body: %s", path, response.Body.String())
+		}
+		if response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("path=%s lookup must not return stale cached data: %v", path, response.Header())
+		}
+	}
+}
+
+func TestLookupNotFound(t *testing.T) {
+	handler := New(&fakeStore{}, &fakeImporter{}, "secret", 1<<20).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/123456", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusNotFound {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-	}
-	if !strings.Contains(response.Body.String(), `"iin":"45717360"`) {
-		t.Fatalf("unexpected body: %s", response.Body.String())
-	}
-	if response.Header().Get("Cache-Control") != "no-store" {
-		t.Fatalf("lookup must not return stale cached data: %v", response.Header())
 	}
 }
 
@@ -84,6 +97,9 @@ func TestDataPageRequiresServerSidePassword(t *testing.T) {
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized status=%d", unauthorized.Code)
 	}
+	if got := unauthorized.Header().Get("WWW-Authenticate"); got != `Basic realm="BIN data admin", charset="UTF-8"` {
+		t.Fatalf("unexpected authentication challenge %q", got)
+	}
 
 	request := httptest.NewRequest(http.MethodGet, "/data", nil)
 	request.SetBasicAuth("admin", "very-secret-password")
@@ -100,20 +116,7 @@ func TestDataPageRequiresServerSidePassword(t *testing.T) {
 func TestDataImport(t *testing.T) {
 	dataImporter := &fakeImporter{}
 	server := New(&fakeStore{}, dataImporter, "secret", 1<<20)
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	_ = writer.WriteField("csrf_token", server.csrfToken)
-	_ = writer.WriteField("format", "binlist")
-	_ = writer.WriteField("mode", "merge")
-	file, err := writer.CreateFormFile("dataset", "bins.csv")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = file.Write([]byte("BIN,Brand\n123456,VISA\n"))
-	_ = writer.Close()
-
-	request := httptest.NewRequest(http.MethodPost, "/data/import", &body)
-	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request := newUploadRequest(t, server.csrfToken, "merge")
 	request.SetBasicAuth("admin", "secret")
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
@@ -123,4 +126,80 @@ func TestDataImport(t *testing.T) {
 	if !dataImporter.called || dataImporter.format != "binlist" || dataImporter.replace || !strings.Contains(dataImporter.content, "123456") {
 		t.Fatalf("unexpected import call: %+v", dataImporter)
 	}
+}
+
+func TestDataReplace(t *testing.T) {
+	dataImporter := &fakeImporter{}
+	server := New(&fakeStore{}, dataImporter, "secret", 1<<20)
+	request := newUploadRequest(t, server.csrfToken, "replace")
+	request.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || !dataImporter.called || !dataImporter.replace {
+		t.Fatalf("replace import failed: status=%d importer=%+v body=%s", response.Code, dataImporter, response.Body.String())
+	}
+}
+
+func TestDataImportRejectsInvalidCSRF(t *testing.T) {
+	dataImporter := &fakeImporter{}
+	server := New(&fakeStore{}, dataImporter, "secret", 1<<20)
+	request := newUploadRequest(t, "wrong-token", "merge")
+	request.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dataImporter.called {
+		t.Fatal("importer was called after failed CSRF validation")
+	}
+}
+
+func TestDataImportRejectsInvalidMode(t *testing.T) {
+	dataImporter := &fakeImporter{}
+	server := New(&fakeStore{}, dataImporter, "secret", 1<<20)
+	request := newUploadRequest(t, server.csrfToken, "unknown")
+	request.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if dataImporter.called {
+		t.Fatal("importer was called with an invalid mode")
+	}
+}
+
+func TestDataUpdate(t *testing.T) {
+	dataImporter := &fakeImporter{}
+	server := New(&fakeStore{}, dataImporter, "secret", 1<<20)
+	form := url.Values{"csrf_token": []string{server.csrfToken}}
+	request := httptest.NewRequest(http.MethodPost, "/data/update", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || !dataImporter.called {
+		t.Fatalf("update check failed: status=%d importer=%+v body=%s", response.Code, dataImporter, response.Body.String())
+	}
+}
+
+func newUploadRequest(t *testing.T, csrfToken, mode string) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("csrf_token", csrfToken)
+	_ = writer.WriteField("format", "binlist")
+	_ = writer.WriteField("mode", mode)
+	file, err := writer.CreateFormFile("dataset", "bins.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = file.Write([]byte("BIN,Brand\n123456,VISA\n"))
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/data/import", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	return request
 }

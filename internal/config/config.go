@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -44,33 +47,65 @@ var (
 
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		HTTPAddr:          envString("HTTP_ADDR", ":8080"),
 		DatabaseURL:       strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		GitHubToken:       strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
 		DataAdminPassword: os.Getenv("DATA_ADMIN_PASSWORD"),
-		SyncEnabled:       envBool("SYNC_ENABLED", true),
-		SyncOnStart:       envBool("SYNC_ON_START", true),
-		SyncInterval:      envDuration("SYNC_INTERVAL", 5*time.Minute),
-		MaxDownloadBytes:  envInt64("MAX_DOWNLOAD_BYTES", 100<<20),
-		MaxInvalidRatio:   envFloat("MAX_INVALID_RATIO", 0.05),
-		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
-		DatabaseMaxConns:  int32(envInt("DATABASE_MAX_CONNS", 10)),
 	}
+	var err error
+	if cfg.SyncEnabled, err = envBool("SYNC_ENABLED", true); err != nil {
+		return Config{}, err
+	}
+	if cfg.SyncOnStart, err = envBool("SYNC_ON_START", true); err != nil {
+		return Config{}, err
+	}
+	if cfg.SyncInterval, err = envDuration("SYNC_INTERVAL", 5*time.Minute); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxDownloadBytes, err = envInt64("MAX_DOWNLOAD_BYTES", 100<<20); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxInvalidRatio, err = envFloat("MAX_INVALID_RATIO", 0.05); err != nil {
+		return Config{}, err
+	}
+	if cfg.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", 15*time.Second); err != nil {
+		return Config{}, err
+	}
+	maxConns, err := envInt("DATABASE_MAX_CONNS", 10)
+	if err != nil {
+		return Config{}, err
+	}
+	if int64(maxConns) > int64(1<<31-1) {
+		return Config{}, errors.New("DATABASE_MAX_CONNS is too large")
+	}
+	cfg.DatabaseMaxConns = int32(maxConns)
 
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL is required")
 	}
-	if cfg.DataAdminPassword != "" && len(cfg.DataAdminPassword) < 16 {
-		return Config{}, errors.New("DATA_ADMIN_PASSWORD must be at least 16 characters when set")
+	if strings.TrimSpace(cfg.DataAdminPassword) == "" {
+		return Config{}, errors.New("DATA_ADMIN_PASSWORD is required")
+	}
+	if len(cfg.DataAdminPassword) < 16 {
+		return Config{}, errors.New("DATA_ADMIN_PASSWORD must be at least 16 characters")
+	}
+	if cfg.DataAdminPassword == "replace-with-a-long-random-password" {
+		return Config{}, errors.New("DATA_ADMIN_PASSWORD must be changed from the example value")
+	}
+	if err := validateHTTPAddr(cfg.HTTPAddr); err != nil {
+		return Config{}, err
 	}
 	if cfg.SyncInterval < 30*time.Second {
 		return Config{}, errors.New("SYNC_INTERVAL must be at least 30s")
 	}
-	if cfg.MaxDownloadBytes < 1<<20 {
-		return Config{}, errors.New("MAX_DOWNLOAD_BYTES must be at least 1 MiB")
+	if cfg.MaxDownloadBytes < 1<<20 || cfg.MaxDownloadBytes > 1<<30 {
+		return Config{}, errors.New("MAX_DOWNLOAD_BYTES must be between 1 MiB and 1 GiB")
 	}
-	if cfg.MaxInvalidRatio < 0 || cfg.MaxInvalidRatio > 1 {
+	if math.IsNaN(cfg.MaxInvalidRatio) || math.IsInf(cfg.MaxInvalidRatio, 0) || cfg.MaxInvalidRatio < 0 || cfg.MaxInvalidRatio > 1 {
 		return Config{}, errors.New("MAX_INVALID_RATIO must be between 0 and 1")
+	}
+	if cfg.ShutdownTimeout <= 0 {
+		return Config{}, errors.New("SHUTDOWN_TIMEOUT must be positive")
 	}
 	if cfg.DatabaseMaxConns < 2 {
 		return Config{}, errors.New("DATABASE_MAX_CONNS must be at least 2")
@@ -86,11 +121,11 @@ func Load() (Config, error) {
 
 func loadSources() ([]Source, error) {
 	data := strings.TrimSpace(os.Getenv("SOURCES_JSON"))
-	if path := strings.TrimSpace(os.Getenv("SOURCES_FILE")); path != "" {
+	if filePath := strings.TrimSpace(os.Getenv("SOURCES_FILE")); filePath != "" {
 		if data != "" {
 			return nil, errors.New("set only one of SOURCES_JSON and SOURCES_FILE")
 		}
-		contents, err := os.ReadFile(path)
+		contents, err := os.ReadFile(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("read SOURCES_FILE: %w", err)
 		}
@@ -101,12 +136,18 @@ func loadSources() ([]Source, error) {
 	}
 
 	var sources []Source
-	if err := json.Unmarshal([]byte(data), &sources); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&sources); err != nil {
 		return nil, fmt.Errorf("parse sources configuration: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("sources configuration must contain one JSON array")
 	}
 	if len(sources) == 0 {
 		return nil, errors.New("at least one source is required")
 	}
+
 	seen := make(map[string]struct{}, len(sources))
 	for i := range sources {
 		s := &sources[i]
@@ -124,19 +165,22 @@ func loadSources() ([]Source, error) {
 		if s.MinRecords == 0 {
 			s.MinRecords = 100
 		}
-		if !idPattern.MatchString(s.ID) || s.ID == "manual" {
+		if !idPattern.MatchString(s.ID) || strings.EqualFold(s.ID, "manual") {
 			return nil, fmt.Errorf("source %d has invalid or reserved id %q", i, s.ID)
 		}
 		if !repoPattern.MatchString(s.Repository) {
 			return nil, fmt.Errorf("source %q has invalid repository %q", s.ID, s.Repository)
 		}
-		if s.Path == "" || strings.Contains(s.Path, "..") {
+		if s.Path == "" || strings.ContainsRune(s.Path, '\x00') || hasParentPath(s.Path) {
 			return nil, fmt.Errorf("source %q has invalid path", s.ID)
 		}
 		switch s.Format {
 		case "generic", "binlist", "ranges":
 		default:
 			return nil, fmt.Errorf("source %q has unsupported format %q", s.ID, s.Format)
+		}
+		if s.Priority >= 1000 {
+			return nil, fmt.Errorf("source %q priority must be below 1000; priority 1000 is reserved for manual data", s.ID)
 		}
 		if s.MinRecords < 1 {
 			return nil, fmt.Errorf("source %q min_records must be positive", s.ID)
@@ -149,69 +193,90 @@ func loadSources() ([]Source, error) {
 	return sources, nil
 }
 
-func env(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
+func validateHTTPAddr(address string) error {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid HTTP_ADDR %q: %w", address, err)
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return fmt.Errorf("HTTP_ADDR %q must contain a port between 1 and 65535", address)
+	}
+	return nil
+}
+
+func hasParentPath(filePath string) bool {
+	for _, part := range strings.Split(filePath, "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func envString(name, fallback string) string {
+	if value, ok := os.LookupEnv(name); ok {
+		return strings.TrimSpace(value)
 	}
 	return fallback
 }
 
-func envBool(name string, fallback bool) bool {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return fallback
+func envBool(name string, fallback bool) (bool, error) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback, nil
 	}
-	parsed, err := strconv.ParseBool(value)
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
 	if err != nil {
-		return fallback
+		return false, fmt.Errorf("%s must be true or false", name)
 	}
-	return parsed
+	return parsed, nil
 }
 
-func envDuration(name string, fallback time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return fallback
+func envDuration(name string, fallback time.Duration) (time.Duration, error) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback, nil
 	}
-	parsed, err := time.ParseDuration(value)
+	parsed, err := time.ParseDuration(strings.TrimSpace(value))
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("%s must be a duration such as 5m: %w", name, err)
 	}
-	return parsed
+	return parsed, nil
 }
 
-func envInt(name string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return fallback
+func envInt(name string, fallback int) (int, error) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback, nil
 	}
-	parsed, err := strconv.Atoi(value)
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
 	}
-	return parsed
+	return parsed, nil
 }
 
-func envInt64(name string, fallback int64) int64 {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return fallback
+func envInt64(name string, fallback int64) (int64, error) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback, nil
 	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
+	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
 	}
-	return parsed
+	return parsed, nil
 }
 
-func envFloat(name string, fallback float64) float64 {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return fallback
+func envFloat(name string, fallback float64) (float64, error) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback, nil
 	}
-	parsed, err := strconv.ParseFloat(value, 64)
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("%s must be a number: %w", name, err)
 	}
-	return parsed
+	return parsed, nil
 }

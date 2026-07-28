@@ -18,11 +18,17 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://binapi:binapi@postgres:5432/binapi?sslmode=disable
+      DATA_ADMIN_PASSWORD: ${DATA_ADMIN_PASSWORD:?set DATA_ADMIN_PASSWORD in .env}
       HTTP_ADDR: :8080
-      SYNC_INTERVAL: 5m
-      DATA_ADMIN_PASSWORD: ${DATA_ADMIN_PASSWORD:-}
-      # Optional: raises GitHub's server-side API allowance.
+      SYNC_ENABLED: ${SYNC_ENABLED:-true}
+      SYNC_ON_START: ${SYNC_ON_START:-true}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-5m}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      SOURCES_JSON: ${SOURCES_JSON:-}
+      MAX_DOWNLOAD_BYTES: ${MAX_DOWNLOAD_BYTES:-104857600}
+      MAX_INVALID_RATIO: ${MAX_INVALID_RATIO:-0.05}
+      DATABASE_MAX_CONNS: ${DATABASE_MAX_CONNS:-10}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-15s}
     ports:
       - "8080:8080"
     depends_on:

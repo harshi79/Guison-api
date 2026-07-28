@@ -26,6 +26,31 @@ func TestNormalizeQuery(t *testing.T) {
 	}
 }
 
+func TestSixSevenAndEightDigitContainment(t *testing.T) {
+	recordStart, recordEnd := int64(12345600), int64(12345699)
+	for _, iin := range []string{"123456", "1234567", "12345678"} {
+		queryStart, queryEnd, err := NormalizeQuery(iin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recordStart > queryStart || recordEnd < queryEnd {
+			t.Fatalf("six-digit record does not cover query %s", iin)
+		}
+	}
+
+	sevenStart, sevenEnd, err := NormalizeQuery("1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sixStart, sixEnd, err := NormalizeQuery("123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sevenStart <= sixStart && sevenEnd >= sixEnd {
+		t.Fatal("seven-digit record must not satisfy a less-specific six-digit query")
+	}
+}
+
 func TestCountryEmoji(t *testing.T) {
 	if got := CountryEmoji("dk"); got != "🇩🇰" {
 		t.Fatalf("got %q", got)

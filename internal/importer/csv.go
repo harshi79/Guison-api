@@ -53,7 +53,6 @@ type CSVSource struct {
 	reader   *csv.Reader
 	columns  columnMap
 	sourceID string
-	format   string
 	updated  time.Time
 	current  Record
 	err      error
@@ -74,7 +73,7 @@ func NewCSVSource(reader io.Reader, sourceID, format string, updated time.Time) 
 	if err != nil {
 		return nil, err
 	}
-	return &CSVSource{reader: csvReader, columns: columns, sourceID: sourceID, format: format, updated: updated}, nil
+	return &CSVSource{reader: csvReader, columns: columns, sourceID: sourceID, updated: updated}, nil
 }
 
 func (s *CSVSource) Next() bool {
@@ -115,7 +114,6 @@ func (s *CSVSource) Values() ([]any, error) {
 func (s *CSVSource) Err() error         { return s.err }
 func (s *CSVSource) TotalRows() int64   { return s.total }
 func (s *CSVSource) InvalidRows() int64 { return s.invalid }
-func (s *CSVSource) ValidRows() int64   { return s.total - s.invalid }
 
 func (s *CSVSource) parse(row []string) (Record, error) {
 	start := digits(field(row, s.columns.start))
@@ -175,7 +173,7 @@ func mapColumns(header []string, format string) (columnMap, error) {
 		return -1
 	}
 
-	start := find("iin_start", "range_start", "bin", "iin", "prefix")
+	start := find("iin_start", "iinstart", "range_start", "bin_start", "binstart", "bin", "iin", "prefix")
 	// A maintained community file has historically replaced the first "BIN"
 	// header cell with digits while leaving every other header intact. Detect
 	// that shape so one upstream typo does not take the whole service offline.
@@ -187,7 +185,7 @@ func mapColumns(header []string, format string) (columnMap, error) {
 	}
 
 	columns := columnMap{
-		start: start, end: find("iin_end", "range_end", "bin_end"),
+		start: start, end: find("iin_end", "iinend", "range_end", "bin_end", "binend"),
 		numberLength: find("number_length", "card_number_length", "length"), luhn: find("luhn"),
 		cardType: find("type", "card_type", "funding"), cardLevel: find("category", "level", "card_level"),
 		prepaid:     find("prepaid", "is_prepaid"),

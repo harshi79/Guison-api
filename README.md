@@ -50,7 +50,7 @@ https://your-host/data
 The page uses HTTP Basic authentication:
 
 - Username: `admin`
-- Password: the server-side `DATA_ADMIN_PASSWORD` environment variable
+- Password: the server-side `DATA_ADMIN_PASSWORD` environment variable (required, at least 16 characters)
 
 The password is never included in page HTML or frontend JavaScript. There is no JavaScript on the page. Always serve the application over HTTPS in production because Basic authentication credentials must be protected in transit.
 
@@ -101,7 +101,7 @@ The built-in source is the CC BY 4.0 dataset at [`venelinkochev/bin-list-data`](
 | Variable | Default | Purpose |
 |---|---:|---|
 | `DATABASE_URL` | required | PostgreSQL connection URL |
-| `DATA_ADMIN_PASSWORD` | empty | Enables and protects `/data` |
+| `DATA_ADMIN_PASSWORD` | required | Protects `/data`; minimum 16 characters |
 | `HTTP_ADDR` | `:8080` | HTTP listen address |
 | `SYNC_ENABLED` | `true` | Enable periodic GitHub checks |
 | `SYNC_ON_START` | `true` | Check configured sources at startup |
@@ -109,12 +109,12 @@ The built-in source is the CC BY 4.0 dataset at [`venelinkochev/bin-list-data`](
 | `GITHUB_TOKEN` | empty | Optional server-side token for GitHub API allowance |
 | `SOURCES_FILE` | empty | Path to source configuration JSON |
 | `SOURCES_JSON` | built-in source | Inline source configuration JSON |
-| `MAX_DOWNLOAD_BYTES` | `104857600` | Maximum automatic or manual CSV size |
+| `MAX_DOWNLOAD_BYTES` | `104857600` | Maximum automatic or manual CSV size; 1 MiB–1 GiB |
 | `MAX_INVALID_RATIO` | `0.05` | Maximum fraction of invalid CSV rows |
 | `DATABASE_MAX_CONNS` | `10` | PostgreSQL pool size |
 | `SHUTDOWN_TIMEOUT` | `15s` | Graceful shutdown deadline |
 
-Only one of `SOURCES_FILE` and `SOURCES_JSON` may be set.
+Only one of `SOURCES_FILE` and `SOURCES_JSON` may be set. Docker Compose forwards `SOURCES_JSON`; use `SOURCES_FILE` only when that file is available inside the running container. Invalid booleans, durations, numbers, addresses, passwords, or unknown source fields stop startup with a clear error instead of silently using a default.
 
 ## Source configuration
 
@@ -132,7 +132,7 @@ Only one of `SOURCES_FILE` and `SOURCES_JSON` may be set.
 ]
 ```
 
-`repository` is a GitHub `owner/repository`. Source IDs cannot use the reserved ID `manual`.
+`repository` is a GitHub `owner/repository`. Source IDs cannot use the reserved ID `manual`. Automatic source priorities must be below `1000`; the manual source uses priority `1000` so admin corrections always win when records overlap.
 
 ## Development
 

@@ -50,6 +50,17 @@ func TestRangesCSV(t *testing.T) {
 	}
 }
 
+func TestCamelCaseRangeHeaders(t *testing.T) {
+	input := "IINStart,IINEnd,Scheme\n1234567,1234567,VISA\n"
+	source, err := NewCSVSource(strings.NewReader(input), "test", "generic", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !source.Next() || source.current.Start8 != 12345670 || source.current.End8 != 12345679 {
+		t.Fatalf("camel-case range headers were not parsed: err=%v record=%+v", source.Err(), source.current)
+	}
+}
+
 func TestMalformedCommunityHeaderIsRecovered(t *testing.T) {
 	input := "543924,brand,type,category,issuer,alpha_2\n543925,VISA,DEBIT,,A Bank,GB\n"
 	source, err := NewCSVSource(strings.NewReader(input), "community", "binlist", time.Now())
@@ -81,7 +92,9 @@ func TestNormalizeRange(t *testing.T) {
 		wantStart, wantEnd int64
 	}{
 		{"123456", "123456", 12345600, 12345699},
+		{"1234567", "1234567", 12345670, 12345679},
 		{"12345678", "12345678", 12345678, 12345678},
+		{"001234", "001234", 123400, 123499},
 		{"0", "0", 0, 9999999},
 	}
 	for _, test := range tests {

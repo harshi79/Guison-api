@@ -158,7 +158,8 @@ func (db *DB) Lookup(ctx context.Context, iin string) (*model.LookupResult, erro
 		JOIN sources s ON s.id=b.source_id AND s.enabled=true AND s.status='ready'
 		WHERE int8range(b.start8, b.end8, '[]') @> $1::bigint
 		  AND int8range(b.start8, b.end8, '[]') @> $2::bigint
-		ORDER BY (b.end8-b.start8) ASC, b.iin_length DESC, s.priority DESC, b.updated_at DESC
+		ORDER BY (s.priority=1000) DESC, (b.end8-b.start8) ASC,
+		         b.iin_length DESC, s.priority DESC, b.updated_at DESC
 		LIMIT 1`, start, end).Scan(
 		&result.Match.Start, &result.Match.End, &result.Match.Length,
 		&result.Number.Length, &result.Number.Luhn, &result.Scheme, &result.Brand, &result.Type, &result.Level, &result.Prepaid,
