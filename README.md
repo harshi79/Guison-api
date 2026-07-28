@@ -117,6 +117,23 @@ Health endpoint meanings:
 - `/healthz`: application process health with uptime information; no database query.
 - `/readyz`: queries PostgreSQL and returns `200` only when at least one usable dataset exists.
 
+## Public website
+
+The Go server also renders the public site. No frontend build step, framework or
+separate deployment is involved; the HTML is server-rendered and the CSS, JS and
+artwork are embedded into the binary with `go:embed`.
+
+- `/` — landing page with a live BIN tester, features, endpoints and FAQ
+- `/docs` — full developer documentation
+- `/assets/...` — embedded CSS, JS and artwork
+
+Set `TELEGRAM_CHANNEL_URL` and `DEVELOPER_TELEGRAM_URL` to activate the community
+buttons. While unset, the site renders a disabled placeholder rather than a
+fabricated link.
+
+The artwork in `internal/httpapi/assets/art/` is original, generated for this
+project, and safe to replace: drop in a file with the same name and size.
+
 ## Lookup API
 
 ```bash
@@ -204,6 +221,8 @@ The built-in source is the CC BY 4.0 dataset at [`venelinkochev/bin-list-data`](
 | `MAX_INVALID_RATIO` | `0.05` | Maximum fraction of invalid CSV rows |
 | `DATABASE_MAX_CONNS` | `10` | PostgreSQL pool size |
 | `SHUTDOWN_TIMEOUT` | `15s` | Graceful shutdown deadline |
+| `TELEGRAM_CHANNEL_URL` | empty | Public website: Telegram channel link. Disabled placeholder when unset |
+| `DEVELOPER_TELEGRAM_URL` | empty | Public website: developer contact link. Disabled placeholder when unset |
 
 Only one of `SOURCES_FILE` and `SOURCES_JSON` may be set. Docker Compose forwards `SOURCES_JSON`; use `SOURCES_FILE` only when that file is available inside the running container. Invalid booleans, durations, numbers, addresses, passwords, or unknown source fields stop startup with a clear error instead of silently using a default.
 
