@@ -170,7 +170,10 @@ h3 { font-size: 1.12rem; }
 
 /* ---------- Hero ---------- */
 .hero { padding: 68px 0 76px; position: relative; overflow: hidden; }
-.hero-grid { display: grid; grid-template-columns: 1.08fr 0.92fr; gap: 48px; align-items: center; }
+/* Balanced two-column layout: text on the left, artwork on the right. The
+   right column is given equal room so the wide 1.75 : 1 artwork (locked to
+   the source hero.webp) can sit at a premium size without feeling squeezed. */
+.hero-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; align-items: center; }
 
 .hero h1 {
   font-size: clamp(2.5rem, 6vw, 4rem);
@@ -194,17 +197,30 @@ h3 { font-size: 1.12rem; }
 .stat b { display: block; font-size: 1.42rem; font-weight: 730; letter-spacing: -0.02em; color: var(--lime); }
 .stat span { font-size: 0.82rem; color: var(--muted); }
 
-.hero-art { position: relative; }
-/* The artwork is generated on the exact page background (--bg) and its edges are
-   faded through a mask, so it merges into the page instead of sitting in a box. */
+.hero-art {
+  position: relative;
+  width: 100%;
+  max-width: 600px;
+  margin-left: auto;
+  aspect-ratio: 1600 / 913;
+}
+/* The same /assets/art/hero.webp is used at every breakpoint. The container is
+   locked to the source image's natural aspect ratio (1600 × 913 ≈ 1.75 : 1) and
+   the <img> fills it with object-fit: contain, so the complete artwork — the
+   character, the laptop, the headphones, and the dark atmospheric space around
+   her — is always shown in full. The image is never cropped, stretched,
+   zoomed-in, or distorted, and the original aspect ratio is preserved. A soft
+   lime glow + radial edge mask then merge the artwork into the page background
+   so the wide composition feels intentional rather than boxed. */
 .hero-art img {
-  width: 100%; height: auto; display: block;
+  width: 100%; height: 100%; display: block;
+  object-fit: contain; object-position: center;
   filter: drop-shadow(0 0 46px rgba(180, 255, 46, 0.14));
-  mask-image: radial-gradient(120% 108% at 68% 50%, #000 52%, transparent 96%);
-  -webkit-mask-image: radial-gradient(120% 108% at 68% 50%, #000 52%, transparent 96%);
+  mask-image: radial-gradient(118% 110% at 50% 50%, #000 70%, transparent 100%);
+  -webkit-mask-image: radial-gradient(118% 110% at 50% 50%, #000 70%, transparent 100%);
 }
 .hero-art::after {
-  content: ""; position: absolute; inset: -14%; z-index: -1; border-radius: 50%;
+  content: ""; position: absolute; inset: -12%; z-index: -1; border-radius: 50%;
   background: radial-gradient(circle, rgba(180, 255, 46, 0.16), transparent 66%);
   filter: blur(34px);
 }
@@ -502,16 +518,20 @@ table.api td:first-child { color: var(--text); font-family: var(--mono); font-si
 /* ---------- Responsive ---------- */
 @media (max-width: 980px) {
   .hero-grid { grid-template-columns: 1fr; gap: 40px; }
-  /* Stacked hero: crop the empty desktop text-space out of the artwork so the
-     mascot stays large and readable instead of shrinking to a thumbnail. */
+  /* Stacked hero on tablet/phone. The same hero.webp is shown in full — the
+     container keeps the source aspect ratio (1600 × 913 ≈ 1.75 : 1) and the
+     <img> uses object-fit: contain, so the character and laptop are never
+     cropped off. Centred with auto margins and a comfortable max-width so the
+     artwork keeps visual presence on narrow screens. */
   .hero-art {
-    max-width: 440px; margin: 0 auto; order: -1;
-    aspect-ratio: 5 / 4; overflow: hidden;
+    max-width: 480px; margin: 0 auto; order: -1;
+    aspect-ratio: 1600 / 913;
   }
   .hero-art img {
-    width: 100%; height: 100%; object-fit: cover; object-position: 74% 42%;
-    mask-image: radial-gradient(112% 106% at 52% 48%, #000 58%, transparent 97%);
-    -webkit-mask-image: radial-gradient(112% 106% at 52% 48%, #000 58%, transparent 97%);
+    width: 100%; height: 100%;
+    object-fit: contain; object-position: center;
+    mask-image: radial-gradient(116% 110% at 50% 50%, #000 70%, transparent 100%);
+    -webkit-mask-image: radial-gradient(116% 110% at 50% 50%, #000 70%, transparent 100%);
   }
   .faq-layout { grid-template-columns: 1fr; }
   .faq-art { display: none; }
