@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,12 +16,14 @@ import (
 	"time"
 
 	"github.com/harshi79/project-17/internal/config"
+	"github.com/harshi79/project-17/internal/database"
 	"github.com/harshi79/project-17/internal/importer"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var copyColumns = []string{
+// importColumns are the destination columns, in the order the importer's
+// Values() supplies them. source_id, iin_start and iin_end lead so the
+// composite primary key matches.
+var importColumns = []string{
 	"source_id", "iin_start", "iin_end", "iin_length", "start8", "end8",
 	"number_length", "luhn", "scheme", "brand", "card_type", "card_level", "prepaid",
 	"country_alpha2", "country_alpha3", "country_name", "country_currency",
@@ -28,10 +31,10 @@ var copyColumns = []string{
 	"bank_name", "bank_url", "bank_phone", "bank_city", "bank_logo", "updated_at",
 }
 
-// Manager performs imports one at a time. Automatic checks and admin uploads use
-// the same importer, so there is only one update path to understand.
+// Manager performs imports one at a time. Automatic checks and admin uploads
+// use the same importer, so there is only one update path to understand.
 type Manager struct {
-	pool             *pgxpool.Pool
+	db               *sql.DB
 	github           *GitHubClient
 	sources          []config.Source
 	interval         time.Duration
@@ -41,9 +44,9 @@ type Manager struct {
 	wg               sync.WaitGroup
 }
 
-func New(pool *pgxpool.Pool, github *GitHubClient, sources []config.Source, interval time.Duration, maxInvalidRatio float64, maxDownloadBytes int64) *Manager {
+func New(db *sql.DB, github *GitHubClient, sources []config.Source, interval time.Duration, maxInvalidRatio float64, maxDownloadBytes int64) *Manager {
 	return &Manager{
-		pool: pool, github: github, sources: sources, interval: interval,
+		db: db, github: github, sources: sources, interval: interval,
 		maxInvalidRatio: maxInvalidRatio, maxDownloadBytes: maxDownloadBytes,
 	}
 }
@@ -102,11 +105,11 @@ func (m *Manager) Sync(ctx context.Context, source config.Source) error {
 	}
 
 	var currentSHA string
-	if err := m.pool.QueryRow(ctx, `SELECT current_sha FROM sources WHERE id=$1 AND enabled=true`, source.ID).Scan(&currentSHA); err != nil {
+	if err := m.db.QueryRowContext(ctx, `SELECT current_sha FROM sources WHERE id=?1 AND enabled=1`, source.ID).Scan(&currentSHA); err != nil {
 		return fmt.Errorf("read source state: %w", err)
 	}
 	if currentSHA == commit.SHA {
-		_, err := m.pool.Exec(ctx, `UPDATE sources SET last_checked_at=now(), last_error='', updated_at=now() WHERE id=$1`, source.ID)
+		_, err := m.db.ExecContext(ctx, `UPDATE sources SET last_checked_at=?2, last_error='', updated_at=?2 WHERE id=?1`, source.ID, database.NowSQL())
 		return err
 	}
 
@@ -180,95 +183,166 @@ func (m *Manager) ImportUpload(ctx context.Context, reader io.Reader, filename, 
 }
 
 func (m *Manager) ensureManualSource(ctx context.Context, source config.Source) error {
-	_, err := m.pool.Exec(ctx, `
+	_, err := m.db.ExecContext(ctx, `
 		INSERT INTO sources(id, repository, branch, path, parser, priority, enabled, status)
-		VALUES($1,$2,$3,$4,$5,$6,true,'pending')
+		VALUES(?1,?2,?3,?4,?5,?6,1,'pending')
 		ON CONFLICT(id) DO UPDATE SET
 			repository=excluded.repository, branch=excluded.branch, path=excluded.path,
-			parser=excluded.parser, priority=excluded.priority, enabled=true,
+			parser=excluded.parser, priority=excluded.priority, enabled=1,
 			status=CASE WHEN sources.record_count>0 THEN 'ready' ELSE 'pending' END,
-			last_error='', updated_at=now()`,
-		source.ID, source.Repository, source.Branch, source.Path, source.Format, source.Priority)
+			last_error='', updated_at=?7`,
+		source.ID, source.Repository, source.Branch, source.Path, source.Format, source.Priority, database.NowSQL())
 	return err
 }
 
+// importFile streams the CSV into the destination source inside one transaction.
+//
+// There is no durable staging table (SQLite TEMP tables are per-connection and
+// invisible to the transaction's final statement), so validation happens while
+// records are buffered in memory; nothing is written to bin_records until the
+// whole buffer has passed the row-count, invalid-ratio and minimum-record
+// checks, and the install runs in the same transaction as the source-status
+// update. A failure at any step rolls the transaction back, preserving the
+// previous dataset.
 func (m *Manager) importFile(ctx context.Context, source config.Source, commit Commit, file *os.File, replace bool) (int64, error) {
-	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE staging_records (LIKE bin_records INCLUDING DEFAULTS EXCLUDING CONSTRAINTS EXCLUDING INDEXES) ON COMMIT DROP`); err != nil {
-		return 0, fmt.Errorf("create staging table: %w", err)
-	}
 	parser, err := importer.NewCSVSource(file, source.ID, source.Format, commit.Date)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staging_records"}, copyColumns, parser); err != nil {
-		return 0, fmt.Errorf("copy source data: %w", err)
+
+	// First the allocate-free validation pass: stream every row once,
+	// keeping only the validated records for the install.
+	records := make([][]any, 0, 400000)
+	for parser.Next() {
+		values, err := parser.Values()
+		if err != nil {
+			return 0, fmt.Errorf("parse source data: %w", err)
+		}
+		record := make([]any, len(values))
+		copy(record, values)
+		records = append(records, record)
+	}
+	if err := parser.Err(); err != nil {
+		return 0, err
 	}
 	if parser.TotalRows() > 0 && float64(parser.InvalidRows())/float64(parser.TotalRows()) > m.maxInvalidRatio {
 		return 0, fmt.Errorf("%d of %d rows are invalid; maximum is %.2f%%",
 			parser.InvalidRows(), parser.TotalRows(), m.maxInvalidRatio*100)
 	}
-	var stagedCount int64
-	if err := tx.QueryRow(ctx, `
-		SELECT count(*) FROM (
-			SELECT 1 FROM staging_records GROUP BY source_id, iin_start, iin_end
-		) AS unique_records`).Scan(&stagedCount); err != nil {
-		return 0, fmt.Errorf("count staged records: %w", err)
+
+	// The record count used by validation and /data is the number of keys
+	// actually installed: distinct (source_id, iin_start, iin_end).
+	unique := map[[3]string]struct{}{}
+	deduped := make([][]any, 0, len(records))
+	seen := make(map[[3]string]bool, len(records))
+	for _, record := range records {
+		key := [3]string{record[0].(string), record[1].(string), record[2].(string)}
+		unique[key] = struct{}{}
+		if !seen[key] {
+			seen[key] = true
+			deduped = append(deduped, record)
+		}
 	}
+	stagedCount := int64(len(unique))
 	if stagedCount < int64(source.MinRecords) {
 		return 0, fmt.Errorf("import has %d unique valid records; at least %d required", stagedCount, source.MinRecords)
 	}
 
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	if replace {
-		if _, err := tx.Exec(ctx, `DELETE FROM bin_records WHERE source_id=$1`, source.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM bin_records WHERE source_id=?1`, source.ID); err != nil {
 			return 0, fmt.Errorf("remove old source records: %w", err)
 		}
 	}
-	_, err = tx.Exec(ctx, `
-		INSERT INTO bin_records (`+strings.Join(copyColumns, ",")+`)
-		SELECT DISTINCT ON (source_id, iin_start, iin_end) `+strings.Join(copyColumns, ",")+`
-		FROM staging_records
-		ORDER BY source_id, iin_start, iin_end, ctid DESC
-		ON CONFLICT (source_id, iin_start, iin_end) DO UPDATE SET `+updateAssignments())
-	if err != nil {
-		return 0, fmt.Errorf("install source records: %w", err)
+
+	// ON CONFLICT DO UPDATE keeps the live row on the left-hand side:
+	// excluded.<col> references the incoming row.
+	if err := m.insertRecords(ctx, tx, deduped); err != nil {
+		return 0, err
 	}
 
 	var recordCount int64
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM bin_records WHERE source_id=$1`, source.ID).Scan(&recordCount); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bin_records WHERE source_id=?1`, source.ID).Scan(&recordCount); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE sources SET current_sha=$2, status='ready', record_count=$3, skipped_rows=$4,
-		       last_checked_at=now(), last_synced_at=now(), last_error='', updated_at=now()
-		WHERE id=$1`, source.ID, commit.SHA, recordCount, parser.InvalidRows()); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE sources SET current_sha=?2, status='ready', record_count=?3, skipped_rows=?4,
+		       last_checked_at=?5, last_synced_at=?5, last_error='', updated_at=?5
+		WHERE id=?1`, source.ID, commit.SHA, recordCount, parser.InvalidRows(), database.NowSQL()); err != nil {
 		return 0, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return recordCount, nil
 }
 
+// insertRecords installs deduplicated rows. The rows are written in upload
+// order, and SQLite's ON CONFLICT...DO UPDATE keeps the existing row, so the
+// first row for a given key wins — equivalent to PostgreSQL's
+// DISTINCT ON (... ORDER BY ctid DESC) semantics for a fresh import.
+func (m *Manager) insertRecords(ctx context.Context, tx *sql.Tx, records [][]any) error {
+	if len(records) == 0 {
+		return nil
+	}
+	const batchSize = 1000
+	placeholderSets := placeholders(len(importColumns), batchSize)
+
+	// Precompute the re-ordered columns: the SQL table order is the
+	// importColumns order, so a plain multi-row VALUES batching works and
+	// avoids any per-install share of a temp table.
+	for start := 0; start < len(records); start += batchSize {
+		end := start + batchSize
+		if end > len(records) {
+			end = len(records)
+		}
+		count := end - start
+		tpls := strings.TrimSuffix(placeholderSets[count], ",")
+		statement := "INSERT INTO bin_records (" + strings.Join(importColumns, ",") + ") VALUES " + tpls + " " +
+			"ON CONFLICT(source_id, iin_start, iin_end) DO UPDATE SET " + updateAssignments()
+		args := make([]any, 0, count*len(importColumns))
+		for _, record := range records[start:end] {
+			args = append(args, record...)
+		}
+		if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+			return fmt.Errorf("install source records: %w", err)
+		}
+	}
+	return nil
+}
+
+// updateAssignments builds "col=excluded.col" for every column after the
+// primary key, matching the PostgreSQL upsert's non-key update columns.
 func updateAssignments() string {
-	assignments := make([]string, 0, len(copyColumns)-3)
-	for _, column := range copyColumns[3:] {
+	assignments := make([]string, 0, len(importColumns)-3)
+	for _, column := range importColumns[3:] {
 		assignments = append(assignments, column+"=excluded."+column)
 	}
 	return strings.Join(assignments, ",")
 }
 
+// placeholders returns per-batch "(?,?,...)" placeholder tuples for batches of
+// up to maxRows, indexed by row count.
+func placeholders(columns, maxRows int) map[int]string {
+	sets := make(map[int]string, maxRows)
+	one := "(" + strings.TrimSuffix(strings.Repeat("?,", columns), ",") + ")"
+	for rows := 1; rows <= maxRows; rows++ {
+		sets[rows] = strings.Repeat(one+",", rows)
+	}
+	return sets
+}
+
 func (m *Manager) recordFailure(ctx context.Context, sourceID string, importErr error) {
 	failureCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	_, _ = m.pool.Exec(failureCtx, `
+	_, _ = m.db.ExecContext(failureCtx, `
 		UPDATE sources SET status=CASE WHEN record_count>0 THEN 'ready' ELSE 'error' END,
-		last_checked_at=now(), last_error=$2, updated_at=now() WHERE id=$1`, sourceID, truncateError(importErr))
+		last_checked_at=?2, last_error=?3, updated_at=?2 WHERE id=?1`, sourceID, database.NowSQL(), truncateError(importErr))
 }
 
 func truncateError(err error) string {

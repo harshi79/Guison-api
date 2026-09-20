@@ -27,7 +27,8 @@ type Source struct {
 
 type Config struct {
 	HTTPAddr          string
-	DatabaseURL       string
+	TursoDatabaseURL  string
+	TursoAuthToken    string
 	GitHubToken       string
 	DataAdminPassword string
 	SyncEnabled       bool
@@ -36,7 +37,6 @@ type Config struct {
 	MaxDownloadBytes  int64
 	MaxInvalidRatio   float64
 	ShutdownTimeout   time.Duration
-	DatabaseMaxConns  int32
 	Sources           []Source
 }
 
@@ -48,7 +48,8 @@ var (
 func Load() (Config, error) {
 	cfg := Config{
 		HTTPAddr:          listenAddress(),
-		DatabaseURL:       strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		TursoDatabaseURL:  strings.TrimSpace(os.Getenv("TURSO_DATABASE_URL")),
+		TursoAuthToken:    strings.TrimSpace(os.Getenv("TURSO_AUTH_TOKEN")),
 		GitHubToken:       strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
 		DataAdminPassword: os.Getenv("DATA_ADMIN_PASSWORD"),
 	}
@@ -71,17 +72,12 @@ func Load() (Config, error) {
 	if cfg.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", 15*time.Second); err != nil {
 		return Config{}, err
 	}
-	maxConns, err := envInt("DATABASE_MAX_CONNS", 10)
-	if err != nil {
-		return Config{}, err
-	}
-	if int64(maxConns) > int64(1<<31-1) {
-		return Config{}, errors.New("DATABASE_MAX_CONNS is too large")
-	}
-	cfg.DatabaseMaxConns = int32(maxConns)
 
-	if cfg.DatabaseURL == "" {
-		return Config{}, errors.New("DATABASE_URL is required")
+	if cfg.TursoDatabaseURL == "" {
+		return Config{}, errors.New("TURSO_DATABASE_URL is required")
+	}
+	if cfg.TursoAuthToken == "" {
+		return Config{}, errors.New("TURSO_AUTH_TOKEN is required")
 	}
 	if strings.TrimSpace(cfg.DataAdminPassword) == "" {
 		return Config{}, errors.New("DATA_ADMIN_PASSWORD is required")
@@ -106,9 +102,6 @@ func Load() (Config, error) {
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, errors.New("SHUTDOWN_TIMEOUT must be positive")
-	}
-	if cfg.DatabaseMaxConns < 2 {
-		return Config{}, errors.New("DATABASE_MAX_CONNS must be at least 2")
 	}
 
 	sources, err := loadSources()
@@ -244,18 +237,6 @@ func envDuration(name string, fallback time.Duration) (time.Duration, error) {
 	parsed, err := time.ParseDuration(strings.TrimSpace(value))
 	if err != nil {
 		return 0, fmt.Errorf("%s must be a duration such as 5m: %w", name, err)
-	}
-	return parsed, nil
-}
-
-func envInt(name string, fallback int) (int, error) {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return fallback, nil
-	}
-	parsed, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
 	}
 	return parsed, nil
 }

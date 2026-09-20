@@ -33,7 +33,7 @@ type Bank struct {
 
 // Attribution records which imported dataset a lookup row came from.
 //
-// This is internal provenance. It is still read from PostgreSQL on every
+// This is internal provenance. It is still read from the database on every
 // lookup and remains available to logging, the syncer and the protected
 // /data administration page, but it is deliberately not serialised into
 // public API responses.

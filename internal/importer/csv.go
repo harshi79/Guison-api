@@ -11,7 +11,7 @@ import (
 	"unicode"
 )
 
-// Record is the source-neutral representation copied into PostgreSQL.
+// Record is the source-neutral representation copied into the database.
 type Record struct {
 	SourceID         string
 	IINStart         string
@@ -48,7 +48,8 @@ type columnMap struct {
 	bankName, bankURL, bankPhone, bankCity, bankLogo int
 }
 
-// CSVSource implements pgx.CopyFromSource without coupling this package to pgx.
+// CSVSource streams parsed records without coupling this package to any
+// specific database driver.
 type CSVSource struct {
 	reader   *csv.Reader
 	columns  columnMap

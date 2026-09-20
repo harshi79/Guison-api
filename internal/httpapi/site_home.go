@@ -79,7 +79,7 @@ const homeHTML = `
       <div class="card">
         <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg></div>
         <h3>{{if .HasRecordCount}}{{.RecordCount}} records{{else}}Bulk BIN dataset{{end}}</h3>
-        <p>A large imported dataset of BIN/IIN ranges stored in PostgreSQL and served directly from the database.</p>
+        <p>A large imported dataset of BIN/IIN ranges stored in Turso and served directly from the database.</p>
       </div>
       <div class="card">
         <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></div>

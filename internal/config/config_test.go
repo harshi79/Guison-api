@@ -7,7 +7,8 @@ import (
 
 func setValidEnvironment(t *testing.T) {
 	t.Helper()
-	t.Setenv("DATABASE_URL", "postgres://example")
+	t.Setenv("TURSO_DATABASE_URL", "libsql://example-test.turso.io")
+	t.Setenv("TURSO_AUTH_TOKEN", "test-auth-token")
 	t.Setenv("DATA_ADMIN_PASSWORD", "a-secure-password-for-tests")
 	t.Setenv("HTTP_ADDR", ":8080")
 	t.Setenv("SYNC_ENABLED", "true")
@@ -16,7 +17,6 @@ func setValidEnvironment(t *testing.T) {
 	t.Setenv("MAX_DOWNLOAD_BYTES", "104857600")
 	t.Setenv("MAX_INVALID_RATIO", "0.05")
 	t.Setenv("SHUTDOWN_TIMEOUT", "15s")
-	t.Setenv("DATABASE_MAX_CONNS", "10")
 	t.Setenv("SOURCES_FILE", "")
 	t.Setenv("SOURCES_JSON", `[{"id":"test","repository":"owner/repo","branch":"main","path":"bins.csv","format":"binlist","priority":10,"min_records":1}]`)
 }
@@ -60,6 +60,24 @@ func TestLoadRequiresAdminPassword(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "DATA_ADMIN_PASSWORD is required") {
 		t.Fatalf("expected password error, got %v", err)
+	}
+}
+
+func TestLoadRequiresTursoURL(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("TURSO_DATABASE_URL", "")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "TURSO_DATABASE_URL is required") {
+		t.Fatalf("expected TURSO_DATABASE_URL error, got %v", err)
+	}
+}
+
+func TestLoadRequiresTursoToken(t *testing.T) {
+	setValidEnvironment(t)
+	t.Setenv("TURSO_AUTH_TOKEN", "")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "TURSO_AUTH_TOKEN is required") {
+		t.Fatalf("expected TURSO_AUTH_TOKEN error, got %v", err)
 	}
 }
 
