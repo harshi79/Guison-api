@@ -195,7 +195,9 @@ func TestSiteDoesNotLeakAdminDetails(t *testing.T) {
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
 		body := response.Body.String()
 		for _, secret := range []string{
-			"very-secret-password", "DATA_ADMIN_PASSWORD", "DATABASE_URL", "postgres://",
+			"very-secret-password", "DATA_ADMIN_PASSWORD",
+			"DATABASE_URL", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN",
+			"postgres://", "libsql://",
 		} {
 			if strings.Contains(body, secret) {
 				t.Errorf("%s leaked %q", path, secret)

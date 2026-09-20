@@ -36,7 +36,7 @@ const docsHTML = `
     <section class="doc-sec" id="overview">
       <h2>Overview</h2>
       <p>Guison API resolves a payment card BIN/IIN &mdash; the leading 6 to 8 digits of a card number &mdash; to metadata about the issuing range. A single <code>GET</code> request returns the card scheme, funding type, product level, issuing bank and country as JSON.</p>
-      <p>Guison stores BIN data as <strong>ranges</strong> in PostgreSQL. When you query, it finds every range covering your digits and returns the most specific match, so an 8-digit query can resolve to a narrower record than the equivalent 6-digit prefix.</p>
+      <p>Guison stores BIN data as <strong>ranges</strong> in a Turso/libSQL database. When you query, it finds every range covering your digits and returns the most specific match, so an 8-digit query can resolve to a narrower record than the equivalent 6-digit prefix.</p>
       <p><strong>Guison does not verify cards.</strong> It performs metadata lookup only. It cannot tell you whether a card exists, is active, or has funds.</p>
     </section>
 

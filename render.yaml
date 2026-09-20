@@ -5,7 +5,9 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
-      - key: DATABASE_URL
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
         sync: false
       - key: DATA_ADMIN_PASSWORD
         sync: false

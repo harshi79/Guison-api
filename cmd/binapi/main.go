@@ -33,7 +33,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	db, err := database.Open(ctx, cfg.DatabaseURL, cfg.DatabaseMaxConns)
+	db, err := database.Open(ctx, cfg.TursoDatabaseURL, cfg.TursoAuthToken)
 	if err != nil {
 		return fmt.Errorf("database startup: %w", err)
 	}
@@ -43,7 +43,7 @@ func run() error {
 	}
 
 	github := syncer.NewGitHubClient(cfg.GitHubToken, cfg.MaxDownloadBytes)
-	dataImporter := syncer.New(db.Pool, github, cfg.Sources, cfg.SyncInterval, cfg.MaxInvalidRatio, cfg.MaxDownloadBytes)
+	dataImporter := syncer.New(db.DB(), github, cfg.Sources, cfg.SyncInterval, cfg.MaxInvalidRatio, cfg.MaxDownloadBytes)
 	if cfg.SyncEnabled {
 		dataImporter.Run(ctx, cfg.SyncOnStart)
 	}

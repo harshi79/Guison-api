@@ -1,6 +1,6 @@
 # Guison API
 
-A lightweight, open-source BIN/IIN lookup API with automatic dataset synchronization, PostgreSQL persistence, a public website, developer docs, and a protected data administration interface.
+A lightweight, open-source BIN/IIN lookup API with automatic dataset synchronization, Turso (libSQL/SQLite) persistence, a public website, developer docs, and a protected data administration interface.
 
 Send the first 6–8 digits of a payment card and get back the card scheme, funding type, product level, issuing bank and country as JSON. No API key, no SDK, no sign-up.
 
@@ -9,6 +9,8 @@ curl https://guison-api.onrender.com/45717360
 ```
 
 > **Guison is a metadata lookup service.** It does **not** verify that a card or account exists, is active, or is valid, and it cannot authorise a payment. See [Data source & credits](#data-source--credits).
+
+> **Storage note (2026).** The persistence layer has been migrated from PostgreSQL (Neon) to Turso/libSQL. Only two environment variables are required for the database — `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` — and a fresh Turso database initializes itself and re-imports the dataset automatically. See [Environment variables](#environment-variables).
 
 ---
 
@@ -48,7 +50,7 @@ curl https://guison-api.onrender.com/45717360
 - **Card level** — product tier such as classic or platinum, when available
 - **Country information** — ISO alpha-2/alpha-3, country name, flag emoji, currency, approximate coordinates
 - **Issuer / bank information** — bank name plus website, phone and city where known
-- **PostgreSQL persistence** — records stored as integer ranges with range-overlap indexing
+- **Turso/libSQL persistence** — records stored as integer ranges with indexed, prefix-filtered containment lookups
 - **Automatic upstream synchronization** — periodic commit checks against configured GitHub CSV sources
 - **Validated transactional imports** — parsed into a staging table and committed atomically; a failed import never takes live data down
 - **Manual CSV import** — merge or replace a manual dataset from the admin page
@@ -57,7 +59,7 @@ curl https://guison-api.onrender.com/45717360
 - **Health and readiness endpoints** for uptime monitors and orchestrators
 - **Docker support** via a multi-stage distroless build
 - **Render compatible**, with a `render.yaml` blueprint
-- **Lightweight Go implementation** — one dependency (`pgx`), no frontend build step
+- **Lightweight Go implementation** — standard-library `database/sql` plus the pure-Go libSQL client, no frontend build step
 
 ---
 
@@ -222,20 +224,21 @@ Treat `404` as a normal outcome, not a failure — it means the BIN is not in th
 
 ## Local installation
 
-**Requirements:** Go 1.24+ and PostgreSQL 14+.
+**Requirements:** Go 1.24+ and a Turso database (or any libSQL endpoint).
 
 ```bash
 git clone https://github.com/harshi79/project-17.git
 cd project-17
 
 cp .env.example .env
-# Edit .env: set DATABASE_URL and a DATA_ADMIN_PASSWORD of at least 16 characters.
+# Edit .env: set TURSO_DATABASE_URL, TURSO_AUTH_TOKEN and a
+# DATA_ADMIN_PASSWORD of at least 16 characters.
 
 go mod download
 go run ./cmd/binapi
 ```
 
-The server applies its embedded schema migrations on startup, registers the configured source, and begins the first import. Watch readiness with:
+The server connects to Turso, applies its embedded schema migrations on startup, registers the configured source, and begins the first import. A completely empty Turso database initializes itself and rebuilds the full (~374K record) dataset from the configured upstream source automatically — no manual table setup is required. Watch readiness with:
 
 ```bash
 curl http://localhost:8080/healthz
@@ -259,7 +262,8 @@ A `Makefile` provides `make test`, `make build`, `make run`, `make fmt`, `make v
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection URL |
+| `TURSO_DATABASE_URL` | Turso/libSQL database URL (begins `libsql://`) |
+| `TURSO_AUTH_TOKEN` | Turso authentication token for that database |
 | `DATA_ADMIN_PASSWORD` | Protects `/data`; minimum 16 characters, and it must not be left as the example value |
 
 **Optional**
@@ -276,7 +280,6 @@ A `Makefile` provides `make test`, `make build`, `make run`, `make fmt`, `make v
 | `SOURCES_FILE` | empty | Path to a source configuration JSON file |
 | `MAX_DOWNLOAD_BYTES` | `104857600` | Maximum CSV size; must be 1 MiB–1 GiB |
 | `MAX_INVALID_RATIO` | `0.05` | Maximum fraction of invalid CSV rows tolerated |
-| `DATABASE_MAX_CONNS` | `10` | PostgreSQL pool size; minimum 2 |
 | `SHUTDOWN_TIMEOUT` | `15s` | Graceful shutdown deadline |
 | `TELEGRAM_CHANNEL_URL` | empty | Website: official channel link |
 | `TELEGRAM_PRIVATE_URL` | empty | Website: private community invite link |
@@ -314,42 +317,45 @@ The repository ships a multi-stage `Dockerfile` producing a distroless, non-root
 docker build -t guison-api .
 
 docker run -d --name guison-api --restart unless-stopped -p 8080:8080 \
-  -e DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require' \
+  -e TURSO_DATABASE_URL='libsql://YOUR-DATABASE.turso.io' \
+  -e TURSO_AUTH_TOKEN='YOUR_TURSO_AUTH_TOKEN' \
   -e DATA_ADMIN_PASSWORD='a-unique-random-value-of-at-least-16-characters' \
   guison-api
 ```
 
-The container is stateless. **All persistent application data lives in PostgreSQL**, not on the container filesystem, so containers can be replaced or scaled freely. Only `/tmp` is used, for staging CSV downloads during import.
+The container is stateless. **All persistent application data lives in Turso**, not on the container filesystem, so containers can be replaced or scaled freely. Only `/tmp` is used, for staging CSV downloads during import.
 
 ---
 
 ## Docker Compose
 
-Compose runs PostgreSQL and the API together — useful for local development.
+Compose builds and runs the API container — useful for local development.
 
 ```bash
 cp .env.example .env
-# Set DATA_ADMIN_PASSWORD; Compose refuses to start without it.
+# Set TURSO_DATABASE_URL, TURSO_AUTH_TOKEN and DATA_ADMIN_PASSWORD;
+# Compose refuses to start without them.
 
 docker compose up --build
 ```
 
-Compose supplies `DATABASE_URL` for its bundled PostgreSQL service automatically. You must provide `DATA_ADMIN_PASSWORD`. Everything else is optional and forwarded from your environment or `.env`, including the three Telegram variables. Database contents persist in the `postgres-data` volume.
+Compose forwards the two Turso variables to the container. You must also provide `DATA_ADMIN_PASSWORD`. Everything else is optional and forwarded from your environment or `.env`, including the three Telegram variables. The volume-less container holds no data itself; all persistence is in Turso.
 
-Stop with `docker compose down`, or `docker compose down -v` to also discard the database volume.
+Stop with `docker compose down`.
 
 ---
 
 ## Render deployment
 
-The project is Render-ready via the Docker runtime. Provision a PostgreSQL instance first (Render PostgreSQL or any external provider).
+The project is Render-ready via the Docker runtime. Provision a Turso database first (`turso db create`, then `turso db show --url` and `turso db tokens create <database>`).
 
 ### Option A — Web Service
 
 1. In Render choose **New → Web Service** and connect this repository.
 2. Select the **Docker** runtime; Render uses the root `Dockerfile` automatically.
 3. Add environment variables:
-   - `DATABASE_URL`
+   - `TURSO_DATABASE_URL`
+   - `TURSO_AUTH_TOKEN`
    - `DATA_ADMIN_PASSWORD`
    - optionally `TELEGRAM_CHANNEL_URL`, `TELEGRAM_PRIVATE_URL`, `DEVELOPER_TELEGRAM_URL`
 4. Set the health check path to **`/health`**.
@@ -357,7 +363,7 @@ The project is Render-ready via the Docker runtime. Provision a PostgreSQL insta
 
 ### Option B — Blueprint
 
-Choose **New → Blueprint** and point Render at [`render.yaml`](render.yaml). It defines one Docker web service, sets `/health` as the health check, and prompts for the secrets. It does **not** provision a database — set `DATABASE_URL` yourself.
+Choose **New → Blueprint** and point Render at [`render.yaml`](render.yaml). It defines one Docker web service, sets `/health` as the health check, and prompts for the secrets. It does **not** provision a database — set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` yourself.
 
 ### Notes
 
@@ -378,12 +384,12 @@ curl https://YOUR-SERVICE.onrender.com/45717360
 
 ## Deploy anywhere
 
-There is no vendor lock-in. Guison runs on anything that provides Docker or a Linux Go runtime, a reachable PostgreSQL database, environment variables, and one HTTP port — a VPS with systemd, a container platform, Kubernetes, or a PaaS.
+There is no vendor lock-in. Guison runs on anything that provides Docker or a Linux Go runtime, a reachable Turso/libSQL database, environment variables, and one HTTP port — a VPS with systemd, a container platform, Kubernetes, or a PaaS.
 
 The recipe is always the same:
 
 1. Build the container (or the Go binary)
-2. Set `DATABASE_URL`
+2. Set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`
 3. Set `DATA_ADMIN_PASSWORD`
 4. Expose the HTTP port — bind with `PORT` or `HTTP_ADDR`
 5. Point health checks at `/health`
@@ -415,9 +421,9 @@ configured source
   → check upstream commit (skip if unchanged)
   → download that exact version
   → streaming CSV parse
-  → temporary PostgreSQL staging table
+  → in-memory staging validation
   → validation (row count, invalid-row ratio)
-  → transactional import
+  → transactional install
   → lookup
 ```
 
@@ -435,7 +441,7 @@ When `SYNC_ENABLED=true`, one background loop checks each configured source ever
 ├── config/                  # example source configuration
 ├── internal/
 │   ├── config/              # environment configuration and validation
-│   ├── database/            # PostgreSQL access, migrations, lookup query
+│   ├── database/            # Turso/libSQL access, migrations, lookup query
 │   │   └── migrations/      # embedded schema
 │   ├── httpapi/             # HTTP routes, public website and docs
 │   │   └── assets/          # embedded CSS, JS and artwork
