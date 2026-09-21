@@ -114,7 +114,7 @@ const homeHTML = `
       <div class="card">
         <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
         <h3>Validated imports</h3>
-        <p>Each update is parsed and validated in a staging table before it replaces live data, so a bad import never takes lookups down.</p>
+        <p>Each update is parsed, validated and installed inside a single transaction before it replaces live data, so a bad import never takes lookups down.</p>
       </div>
       <div class="card">
         <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m8 6-6 6 6 6M16 6l6 6-6 6"/></svg></div>

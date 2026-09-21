@@ -31,6 +31,19 @@ var importColumns = []string{
 	"bank_name", "bank_url", "bank_phone", "bank_city", "bank_logo", "updated_at",
 }
 
+// importBatchSize caps how many parsed rows the import holds in memory at any
+// moment. One batch of 1000 rows x 25 columns keeps peak heap at a few MB, so a
+// source file of any size imports inside the memory budget of a small instance.
+// Buffering the whole file instead peaked at ~580 MB of Go heap on the ~375K row
+// upstream CSV, which a 512 MB instance OOM-killed mid-import (exit 137),
+// restarting the container and the import in a loop.
+const importBatchSize = 1000
+
+// importProgressRows is how often a streaming import reports progress. Render
+// shows only what the process prints, so a multi-minute import that stays
+// silent is indistinguishable from a hung one.
+const importProgressRows int64 = 50_000
+
 // Manager performs imports one at a time. Automatic checks and admin uploads
 // use the same importer, so there is only one update path to understand.
 type Manager struct {
@@ -197,55 +210,20 @@ func (m *Manager) ensureManualSource(ctx context.Context, source config.Source) 
 
 // importFile streams the CSV into the destination source inside one transaction.
 //
-// There is no durable staging table (SQLite TEMP tables are per-connection and
-// invisible to the transaction's final statement), so validation happens while
-// records are buffered in memory; nothing is written to bin_records until the
-// whole buffer has passed the row-count, invalid-ratio and minimum-record
-// checks, and the install runs in the same transaction as the source-status
-// update. A failure at any step rolls the transaction back, preserving the
-// previous dataset.
+// The file is read row by row and installed in bounded batches
+// (importBatchSize rows each) instead of being buffered whole, so peak memory is
+// roughly one batch — a few MB — whatever the size of the source file. There is
+// no durable staging table (SQLite TEMP tables are per-connection and invisible
+// to the transaction's final statement), so validation runs against the rows the
+// transaction has just installed: the invalid-ratio check uses the parser's own
+// counters and the minimum-record check counts the source's rows back out of
+// bin_records. Every write happens inside the single transaction, together with
+// the source-status update, so a failure at any step rolls the transaction back
+// and preserves the previously installed dataset.
 func (m *Manager) importFile(ctx context.Context, source config.Source, commit Commit, file *os.File, replace bool) (int64, error) {
 	parser, err := importer.NewCSVSource(file, source.ID, source.Format, commit.Date)
 	if err != nil {
 		return 0, err
-	}
-
-	// First the allocate-free validation pass: stream every row once,
-	// keeping only the validated records for the install.
-	records := make([][]any, 0, 400000)
-	for parser.Next() {
-		values, err := parser.Values()
-		if err != nil {
-			return 0, fmt.Errorf("parse source data: %w", err)
-		}
-		record := make([]any, len(values))
-		copy(record, values)
-		records = append(records, record)
-	}
-	if err := parser.Err(); err != nil {
-		return 0, err
-	}
-	if parser.TotalRows() > 0 && float64(parser.InvalidRows())/float64(parser.TotalRows()) > m.maxInvalidRatio {
-		return 0, fmt.Errorf("%d of %d rows are invalid; maximum is %.2f%%",
-			parser.InvalidRows(), parser.TotalRows(), m.maxInvalidRatio*100)
-	}
-
-	// The record count used by validation and /data is the number of keys
-	// actually installed: distinct (source_id, iin_start, iin_end).
-	unique := map[[3]string]struct{}{}
-	deduped := make([][]any, 0, len(records))
-	seen := make(map[[3]string]bool, len(records))
-	for _, record := range records {
-		key := [3]string{record[0].(string), record[1].(string), record[2].(string)}
-		unique[key] = struct{}{}
-		if !seen[key] {
-			seen[key] = true
-			deduped = append(deduped, record)
-		}
-	}
-	stagedCount := int64(len(unique))
-	if stagedCount < int64(source.MinRecords) {
-		return 0, fmt.Errorf("import has %d unique valid records; at least %d required", stagedCount, source.MinRecords)
 	}
 
 	tx, err := m.db.BeginTx(ctx, nil)
@@ -260,15 +238,60 @@ func (m *Manager) importFile(ctx context.Context, source config.Source, commit C
 		}
 	}
 
-	// ON CONFLICT DO UPDATE keeps the live row on the left-hand side:
-	// excluded.<col> references the incoming row.
-	if err := m.insertRecords(ctx, tx, deduped); err != nil {
+	batch := newRecordBatch()
+	statements := &insertStatements{}
+	started := time.Now()
+	var installed int64
+	nextProgress := importProgressRows
+
+	for parser.Next() {
+		values, err := parser.Values()
+		if err != nil {
+			return 0, fmt.Errorf("parse source data: %w", err)
+		}
+		if err := batch.add(values); err != nil {
+			return 0, err
+		}
+		if !batch.full() {
+			continue
+		}
+		written, err := batch.flush(ctx, tx, statements)
+		if err != nil {
+			return 0, err
+		}
+		installed += written
+		if installed >= nextProgress {
+			slog.Info("dataset import in progress",
+				"source", source.ID,
+				"rows", installed,
+				"skipped_rows", parser.InvalidRows(),
+				"elapsed", time.Since(started).Round(time.Second).String())
+			nextProgress += importProgressRows
+		}
+	}
+	if err := parser.Err(); err != nil {
 		return 0, err
 	}
+	// The trailing partial batch, if any.
+	written, err := batch.flush(ctx, tx, statements)
+	if err != nil {
+		return 0, err
+	}
+	installed += written
 
+	if parser.TotalRows() > 0 && float64(parser.InvalidRows())/float64(parser.TotalRows()) > m.maxInvalidRatio {
+		return 0, fmt.Errorf("%d of %d rows are invalid; maximum is %.2f%%",
+			parser.InvalidRows(), parser.TotalRows(), m.maxInvalidRatio*100)
+	}
+
+	// The record count used by validation and /data is the number of keys
+	// actually installed: distinct (source_id, iin_start, iin_end).
 	var recordCount int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM bin_records WHERE source_id=?1`, source.ID).Scan(&recordCount); err != nil {
 		return 0, err
+	}
+	if recordCount < int64(source.MinRecords) {
+		return 0, fmt.Errorf("import has %d unique valid records; at least %d required", recordCount, source.MinRecords)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE sources SET current_sha=?2, status='ready', record_count=?3, skipped_rows=?4,
@@ -279,41 +302,89 @@ func (m *Manager) importFile(ctx context.Context, source config.Source, commit C
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	slog.Info("dataset import installed",
+		"source", source.ID, "rows", installed, "records", recordCount,
+		"elapsed", time.Since(started).Round(time.Second).String())
 	return recordCount, nil
 }
 
-// insertRecords installs deduplicated rows. The rows are written in upload
-// order, and SQLite's ON CONFLICT...DO UPDATE keeps the existing row, so the
-// first row for a given key wins — equivalent to PostgreSQL's
-// DISTINCT ON (... ORDER BY ctid DESC) semantics for a fresh import.
-func (m *Manager) insertRecords(ctx context.Context, tx *sql.Tx, records [][]any) error {
-	if len(records) == 0 {
+// recordBatch accumulates at most importBatchSize parsed rows and installs them
+// with a single multi-row upsert.
+//
+// Rows that repeat a primary key (source_id, iin_start, iin_end) collapse
+// inside the batch and the LAST occurrence wins, matching the PostgreSQL
+// import's SELECT DISTINCT ON (...) ... ORDER BY ctid DESC. Keys repeated
+// across two batches resolve the same way: the upsert's DO UPDATE branch
+// overwrites the earlier row with the later one, so the final state is always
+// the last row the file contained for that key.
+type recordBatch struct {
+	rows  [][]any           // one importColumns-ordered row per distinct key
+	index map[[3]string]int // primary key -> position in rows
+}
+
+func newRecordBatch() *recordBatch {
+	return &recordBatch{
+		rows:  make([][]any, 0, importBatchSize),
+		index: make(map[[3]string]int, importBatchSize),
+	}
+}
+
+// add buffers one parsed row. parser.Values() allocates a fresh slice for every
+// row, so the batch keeps it as-is and never copies the whole file.
+func (b *recordBatch) add(values []any) error {
+	key, err := recordKey(values)
+	if err != nil {
+		return err
+	}
+	if position, duplicate := b.index[key]; duplicate {
+		b.rows[position] = values // last occurrence wins
 		return nil
 	}
-	const batchSize = 1000
-	placeholderSets := placeholders(len(importColumns), batchSize)
-
-	// Precompute the re-ordered columns: the SQL table order is the
-	// importColumns order, so a plain multi-row VALUES batching works and
-	// avoids any per-install share of a temp table.
-	for start := 0; start < len(records); start += batchSize {
-		end := start + batchSize
-		if end > len(records) {
-			end = len(records)
-		}
-		count := end - start
-		tpls := strings.TrimSuffix(placeholderSets[count], ",")
-		statement := "INSERT INTO bin_records (" + strings.Join(importColumns, ",") + ") VALUES " + tpls + " " +
-			"ON CONFLICT(source_id, iin_start, iin_end) DO UPDATE SET " + updateAssignments()
-		args := make([]any, 0, count*len(importColumns))
-		for _, record := range records[start:end] {
-			args = append(args, record...)
-		}
-		if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
-			return fmt.Errorf("install source records: %w", err)
-		}
-	}
+	b.index[key] = len(b.rows)
+	b.rows = append(b.rows, values)
 	return nil
+}
+
+// full reports whether the batch has room for no more rows.
+func (b *recordBatch) full() bool { return len(b.rows) >= importBatchSize }
+
+// flush installs the buffered rows with one statement and empties the batch for
+// reuse, so an import of any length allocates no more than one batch of rows.
+func (b *recordBatch) flush(ctx context.Context, tx *sql.Tx, statements *insertStatements) (int64, error) {
+	if len(b.rows) == 0 {
+		return 0, nil
+	}
+	// Args go in flat, row by row, in importColumns order.
+	args := make([]any, 0, len(b.rows)*len(importColumns))
+	for _, row := range b.rows {
+		args = append(args, row...)
+	}
+	// ON CONFLICT DO UPDATE keeps the live row on the left-hand side:
+	// excluded.<col> references the incoming row.
+	if _, err := tx.ExecContext(ctx, statements.forRows(len(b.rows)), args...); err != nil {
+		return 0, fmt.Errorf("install source records: %w", err)
+	}
+	installed := int64(len(b.rows))
+	b.rows = b.rows[:0]
+	clear(b.index)
+	return installed, nil
+}
+
+// recordKey returns a row's primary key: the first three importColumns values
+// (source_id, iin_start, iin_end), which the importer always supplies as text.
+func recordKey(values []any) ([3]string, error) {
+	var key [3]string
+	if len(values) < len(importColumns) {
+		return key, fmt.Errorf("parsed row has %d values; %d columns are required", len(values), len(importColumns))
+	}
+	for i := range key {
+		text, ok := values[i].(string)
+		if !ok {
+			return key, fmt.Errorf("parsed column %s is not text", importColumns[i])
+		}
+		key[i] = text
+	}
+	return key, nil
 }
 
 // updateAssignments builds "col=excluded.col" for every column after the
@@ -326,15 +397,42 @@ func updateAssignments() string {
 	return strings.Join(assignments, ",")
 }
 
-// placeholders returns per-batch "(?,?,...)" placeholder tuples for batches of
-// up to maxRows, indexed by row count.
-func placeholders(columns, maxRows int) map[int]string {
-	sets := make(map[int]string, maxRows)
-	one := "(" + strings.TrimSuffix(strings.Repeat("?,", columns), ",") + ")"
-	for rows := 1; rows <= maxRows; rows++ {
-		sets[rows] = strings.Repeat(one+",", rows)
+// insertStatements caches the rendered upsert per row count. Every full batch of
+// an import shares one statement and the trailing partial batch renders once, so
+// a 375-batch import builds two SQL strings instead of 375. One import runs at a
+// time (Manager.mu), so a per-import cache needs no locking.
+type insertStatements struct {
+	rows      int
+	statement string
+}
+
+// forRows returns the multi-row upsert for a batch of the given size.
+func (c *insertStatements) forRows(rows int) string {
+	if c.rows != rows {
+		c.statement = buildInsertStatement(rows)
+		c.rows = rows
 	}
-	return sets
+	return c.statement
+}
+
+// buildInsertStatement renders one multi-row INSERT for rows rows of
+// len(importColumns) columns, upserting on the primary key.
+func buildInsertStatement(rows int) string {
+	tuple := "(" + strings.TrimSuffix(strings.Repeat("?,", len(importColumns)), ",") + ")"
+	var builder strings.Builder
+	builder.Grow(512 + rows*(len(tuple)+1))
+	builder.WriteString("INSERT INTO bin_records (")
+	builder.WriteString(strings.Join(importColumns, ","))
+	builder.WriteString(") VALUES ")
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(tuple)
+	}
+	builder.WriteString(" ON CONFLICT(source_id, iin_start, iin_end) DO UPDATE SET ")
+	builder.WriteString(updateAssignments())
+	return builder.String()
 }
 
 func (m *Manager) recordFailure(ctx context.Context, sourceID string, importErr error) {

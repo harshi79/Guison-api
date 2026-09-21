@@ -52,7 +52,7 @@ curl https://guison-api.onrender.com/45717360
 - **Issuer / bank information** — bank name plus website, phone and city where known
 - **Turso/libSQL persistence** — records stored as integer ranges with indexed, prefix-filtered containment lookups
 - **Automatic upstream synchronization** — periodic commit checks against configured GitHub CSV sources
-- **Validated transactional imports** — parsed into a staging table and committed atomically; a failed import never takes live data down
+- **Validated transactional imports** — streamed into the database in bounded batches inside one transaction; a failed import never takes live data down
 - **Manual CSV import** — merge or replace a manual dataset from the admin page
 - **Public homepage** with an interactive BIN tester
 - **Developer documentation** at `/docs`
@@ -421,13 +421,16 @@ configured source
   → check upstream commit (skip if unchanged)
   → download that exact version
   → streaming CSV parse
-  → in-memory staging validation
-  → validation (row count, invalid-row ratio)
-  → transactional install
+  → bounded batches of 1,000 rows, deduplicated on the primary key (last row wins)
+  → one multi-row upsert per batch, all inside a single transaction
+  → validation (invalid-row ratio, minimum record count)
+  → commit, or roll back and keep serving the previous dataset
   → lookup
 ```
 
 When `SYNC_ENABLED=true`, one background loop checks each configured source every `SYNC_INTERVAL`. If the upstream commit is unchanged, nothing is downloaded.
+
+**The import never holds the dataset in memory.** Rows are parsed, deduplicated and installed 1,000 at a time, so peak memory stays at a few megabytes regardless of source size — a full ~375K row import runs in roughly 5 MB of Go heap. Progress is logged every 50,000 rows (`dataset import in progress`), so a long first import is visibly moving rather than looking hung.
 
 **Failed imports preserve previously working data.** If download, parsing or validation fails at any step, the transaction is never committed, the previously imported records keep serving, and the error is recorded and shown on `/data`.
 
@@ -489,7 +492,7 @@ The current primary dataset is **[venelinkochev/bin-list-data](https://github.co
 How the data is handled:
 
 - Guison automatically checks configured upstream sources for changes
-- Imports are validated in a staging table before replacing working data
+- Imports are streamed into the database in bounded batches and validated inside one transaction before the new data becomes visible
 - A failed import leaves the previous dataset serving
 
 > **Accuracy disclaimer.** BIN/IIN information may be incomplete, outdated or inaccurate. This is community-maintained open data, not real-time payment network data. Do not treat Guison as authoritative payment verification, and do not use it as a sole fraud or compliance control.
