@@ -168,7 +168,7 @@ func loadSources() ([]Source, error) {
 			return nil, fmt.Errorf("source %q has invalid path", s.ID)
 		}
 		switch s.Format {
-		case "generic", "binlist", "ranges":
+		case "generic", "binlist", "ranges", "openbiin":
 		default:
 			return nil, fmt.Errorf("source %q has unsupported format %q", s.ID, s.Format)
 		}

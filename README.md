@@ -305,7 +305,36 @@ Telegram variables must be absolute `http(s)` URLs. While unset, the website ren
 ]
 ```
 
-Supported `format` values are `binlist`, `ranges` and `generic`. Source IDs cannot use the reserved ID `manual`. Automatic source priorities must be below `1000`; the manual dataset uses priority `1000` so admin corrections always win when ranges overlap. See [`config/sources.example.json`](config/sources.example.json).
+Supported `format` values are `binlist`, `ranges`, `generic` and `openbiin`. Source IDs cannot use the reserved ID `manual`. Automatic source priorities must be below `1000`; the manual dataset uses priority `1000` so admin corrections always win when ranges overlap. See [`config/sources.example.json`](config/sources.example.json).
+
+#### Sharded sources
+
+A source whose `path` names a **directory** instead of a single file imports every file in it. All the shards are read from one pinned commit and installed by a single transaction, so a directory source is as atomic as a single-file one. The combined download is capped by `MAX_DOWNLOAD_BYTES`, and each file is still parsed in bounded batches, so memory stays at a few megabytes:
+
+```json
+{
+  "id": "openbiin",
+  "repository": "Wayproyect/openbiin",
+  "branch": "main",
+  "path": "functions/data",
+  "format": "openbiin",
+  "priority": 50,
+  "min_records": 300000
+}
+```
+
+#### `openbiin` format
+
+[OpenBIIN](https://github.com/Wayproyect/openbiin) stores a fixed 6-digit `BIN6` plus a `Ranges` column holding the 7th and 8th PAN digits as pipe-separated blocks. Each block becomes one record, so a single row can install several:
+
+```
+BIN6,Ranges,Issuer,Country,Brand,Type
+457100,40-45|51-53,NORDEA,DK,visa,debit     ->  45710040..45710045  and  45710051..45710053
+457101,05,SINGLE BANK,US,visa,credit        ->  45710105..45710105
+457102,00-99,FULL BANK,US,visa,credit       ->  45710200..45710299
+```
+
+`Brand` is the payment network, so it maps to `scheme` exactly as `binlist` files do. Blocks that are blank, non-numeric, not exactly two digits or reversed are dropped rather than guessed at, and a row that keeps no block is skipped and counted in `skipped_rows`. Records are read strictly one per line, because a malformed issuer name such as `"ARMENIAN CARD" CJSC` would otherwise make the CSV reader swallow every following row.
 
 ---
 
