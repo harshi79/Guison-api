@@ -127,14 +127,14 @@ func (m *Manager) Sync(ctx context.Context, source config.Source) error {
 	}
 
 	slog.Info("importing changed dataset", "source", source.ID, "commit", commit.SHA)
-	file, err := m.github.Download(ctx, source.Repository, source.Path, commit.SHA)
+	files, err := m.download(ctx, source, commit.SHA)
 	if err != nil {
 		m.recordFailure(ctx, source.ID, err)
 		return err
 	}
-	defer removeFile(file)
+	defer removeFiles(files)
 
-	if _, err := m.importFile(ctx, source, commit, file, true); err != nil {
+	if _, err := m.importFiles(ctx, source, commit, files, true); err != nil {
 		m.recordFailure(ctx, source.ID, err)
 		return err
 	}
@@ -142,11 +142,30 @@ func (m *Manager) Sync(ctx context.Context, source config.Source) error {
 	return nil
 }
 
+// download fetches a source's data. A path naming a directory is a sharded
+// source and every file in that directory is downloaded at the same commit, so
+// the shards can be installed as one consistent snapshot.
+func (m *Manager) download(ctx context.Context, source config.Source, sha string) ([]*os.File, error) {
+	paths, isDirectory, err := m.github.ListDirectory(ctx, source.Repository, source.Path, sha)
+	if err != nil {
+		return nil, err
+	}
+	if !isDirectory {
+		file, err := m.github.Download(ctx, source.Repository, source.Path, sha)
+		if err != nil {
+			return nil, err
+		}
+		return []*os.File{file}, nil
+	}
+	slog.Info("downloading sharded dataset", "source", source.ID, "files", len(paths))
+	return m.github.DownloadAll(ctx, source.Repository, paths, sha)
+}
+
 // ImportUpload imports an admin-provided CSV into the reserved "manual" source.
 // When replace is false, rows are merged with earlier manual uploads.
 func (m *Manager) ImportUpload(ctx context.Context, reader io.Reader, filename, format string, replace bool) (int64, error) {
 	switch format {
-	case "generic", "binlist", "ranges":
+	case "generic", "binlist", "ranges", "openbiin":
 	default:
 		return 0, fmt.Errorf("unsupported CSV format %q", format)
 	}
@@ -187,7 +206,7 @@ func (m *Manager) ImportUpload(ctx context.Context, reader io.Reader, filename, 
 	if err := m.ensureManualSource(ctx, source); err != nil {
 		return 0, err
 	}
-	recordCount, err := m.importFile(ctx, source, commit, file, replace)
+	recordCount, err := m.importFiles(ctx, source, commit, []*os.File{file}, replace)
 	if err != nil {
 		m.recordFailure(ctx, source.ID, err)
 		return 0, err
@@ -208,22 +227,33 @@ func (m *Manager) ensureManualSource(ctx context.Context, source config.Source) 
 	return err
 }
 
-// importFile streams the CSV into the destination source inside one transaction.
-//
-// The file is read row by row and installed in bounded batches
-// (importBatchSize rows each) instead of being buffered whole, so peak memory is
-// roughly one batch — a few MB — whatever the size of the source file. There is
-// no durable staging table (SQLite TEMP tables are per-connection and invisible
-// to the transaction's final statement), so validation runs against the rows the
-// transaction has just installed: the invalid-ratio check uses the parser's own
-// counters and the minimum-record check counts the source's rows back out of
-// bin_records. Every write happens inside the single transaction, together with
-// the source-status update, so a failure at any step rolls the transaction back
-// and preserves the previously installed dataset.
+// importFile streams one CSV into the destination source inside one
+// transaction. See importFiles.
 func (m *Manager) importFile(ctx context.Context, source config.Source, commit Commit, file *os.File, replace bool) (int64, error) {
-	parser, err := importer.NewCSVSource(file, source.ID, source.Format, commit.Date)
-	if err != nil {
-		return 0, err
+	return m.importFiles(ctx, source, commit, []*os.File{file}, replace)
+}
+
+// importFiles streams one or more CSVs into the destination source inside a
+// single transaction.
+//
+// Each file is read row by row and installed in bounded batches
+// (importBatchSize rows each) instead of being buffered whole, so peak memory is
+// roughly one batch — a few MB — whatever the size or number of source files.
+// Sharded sources (a directory of files) therefore cost no more memory than a
+// single-file source: files are parsed one after another and share one batch,
+// one set of parser counters and one transaction.
+//
+// There is no durable staging table (SQLite TEMP tables are per-connection and
+// invisible to the transaction's final statement), so validation runs against
+// the rows the transaction has just installed: the invalid-ratio check uses the
+// parsers' own counters and the minimum-record check counts the source's rows
+// back out of bin_records. Every write happens inside the single transaction,
+// together with the source-status update, so a failure at any step — including
+// a failure part-way through the last shard — rolls the transaction back and
+// preserves the previously installed dataset.
+func (m *Manager) importFiles(ctx context.Context, source config.Source, commit Commit, files []*os.File, replace bool) (int64, error) {
+	if len(files) == 0 {
+		return 0, errors.New("no source files to import")
 	}
 
 	tx, err := m.db.BeginTx(ctx, nil)
@@ -241,36 +271,45 @@ func (m *Manager) importFile(ctx context.Context, source config.Source, commit C
 	batch := newRecordBatch()
 	statements := &insertStatements{}
 	started := time.Now()
-	var installed int64
+	var installed, totalRows, invalidRows, invalidRanges int64
 	nextProgress := importProgressRows
 
-	for parser.Next() {
-		values, err := parser.Values()
-		if err != nil {
-			return 0, fmt.Errorf("parse source data: %w", err)
-		}
-		if err := batch.add(values); err != nil {
-			return 0, err
-		}
-		if !batch.full() {
-			continue
-		}
-		written, err := batch.flush(ctx, tx, statements)
+	for _, file := range files {
+		parser, err := importer.NewCSVSource(file, source.ID, source.Format, commit.Date)
 		if err != nil {
 			return 0, err
 		}
-		installed += written
-		if installed >= nextProgress {
-			slog.Info("dataset import in progress",
-				"source", source.ID,
-				"rows", installed,
-				"skipped_rows", parser.InvalidRows(),
-				"elapsed", time.Since(started).Round(time.Second).String())
-			nextProgress += importProgressRows
+		for parser.Next() {
+			values, err := parser.Values()
+			if err != nil {
+				return 0, fmt.Errorf("parse source data: %w", err)
+			}
+			if err := batch.add(values); err != nil {
+				return 0, err
+			}
+			if !batch.full() {
+				continue
+			}
+			written, err := batch.flush(ctx, tx, statements)
+			if err != nil {
+				return 0, err
+			}
+			installed += written
+			if installed >= nextProgress {
+				slog.Info("dataset import in progress",
+					"source", source.ID,
+					"rows", installed,
+					"skipped_rows", invalidRows+parser.InvalidRows(),
+					"elapsed", time.Since(started).Round(time.Second).String())
+				nextProgress += importProgressRows
+			}
 		}
-	}
-	if err := parser.Err(); err != nil {
-		return 0, err
+		if err := parser.Err(); err != nil {
+			return 0, err
+		}
+		totalRows += parser.TotalRows()
+		invalidRows += parser.InvalidRows()
+		invalidRanges += parser.InvalidRanges()
 	}
 	// The trailing partial batch, if any.
 	written, err := batch.flush(ctx, tx, statements)
@@ -279,9 +318,13 @@ func (m *Manager) importFile(ctx context.Context, source config.Source, commit C
 	}
 	installed += written
 
-	if parser.TotalRows() > 0 && float64(parser.InvalidRows())/float64(parser.TotalRows()) > m.maxInvalidRatio {
+	if invalidRanges > 0 {
+		slog.Warn("dataset rows contained unusable sub-ranges",
+			"source", source.ID, "invalid_ranges", invalidRanges)
+	}
+	if totalRows > 0 && float64(invalidRows)/float64(totalRows) > m.maxInvalidRatio {
 		return 0, fmt.Errorf("%d of %d rows are invalid; maximum is %.2f%%",
-			parser.InvalidRows(), parser.TotalRows(), m.maxInvalidRatio*100)
+			invalidRows, totalRows, m.maxInvalidRatio*100)
 	}
 
 	// The record count used by validation and /data is the number of keys
@@ -296,7 +339,7 @@ func (m *Manager) importFile(ctx context.Context, source config.Source, commit C
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE sources SET current_sha=?2, status='ready', record_count=?3, skipped_rows=?4,
 		       last_checked_at=?5, last_synced_at=?5, last_error='', updated_at=?5
-		WHERE id=?1`, source.ID, commit.SHA, recordCount, parser.InvalidRows(), database.NowSQL()); err != nil {
+		WHERE id=?1`, source.ID, commit.SHA, recordCount, invalidRows, database.NowSQL()); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -455,4 +498,10 @@ func removeFile(file *os.File) {
 	name := file.Name()
 	_ = file.Close()
 	_ = os.Remove(name)
+}
+
+func removeFiles(files []*os.File) {
+	for _, file := range files {
+		removeFile(file)
+	}
 }

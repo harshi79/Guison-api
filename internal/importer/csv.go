@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"bufio"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -48,25 +49,108 @@ type columnMap struct {
 	bankName, bankURL, bankPhone, bankCity, bankLogo int
 }
 
+// FormatOpenBIIN is the sharded OpenBIIN layout: one BIN6 prefix per row plus a
+// pipe-separated list of sub-ranges covering the remaining PAN digits.
+const FormatOpenBIIN = "openbiin"
+
+// openbiinPrefixLength is the fixed 6-digit BIN6 column width required by the
+// upstream contribution rules; openbiinRangeDigits is the sub-range width, which
+// covers the 7th and 8th PAN digits so BIN6 + block fills exactly 8 digits.
+const (
+	openbiinPrefixLength = 6
+	openbiinRangeDigits  = 2
+)
+
 // CSVSource streams parsed records without coupling this package to any
 // specific database driver.
+//
+// Most formats map one CSV row to exactly one record. OpenBIIN rows describe
+// several 8-digit sub-ranges at once (for example "457100,40-45|51-53"), so
+// Next() may yield more than one record for a single row. The extra records
+// live in pending, which holds at most the sub-ranges of the row currently
+// being read, so memory stays bounded no matter how many blocks a row lists.
 type CSVSource struct {
-	reader   *csv.Reader
+	reader   rowReader
 	columns  columnMap
+	format   string
 	sourceID string
 	updated  time.Time
 	current  Record
+	pending  []Record
 	err      error
 	total    int64
 	invalid  int64
+	ranges   int64
 }
 
-func NewCSVSource(reader io.Reader, sourceID, format string, updated time.Time) (*CSVSource, error) {
-	csvReader := csv.NewReader(reader)
-	csvReader.FieldsPerRecord = -1
-	csvReader.LazyQuotes = true
-	csvReader.TrimLeadingSpace = true
-	header, err := csvReader.Read()
+// rowReader yields the fields of one CSV record at a time. The default
+// implementation is encoding/csv; formats whose upstream guarantees one record
+// per line use lineReader instead.
+type rowReader interface {
+	Read() ([]string, error)
+}
+
+// lineReader parses exactly one line per record.
+//
+// encoding/csv treats a field that opens with a quote and then continues after
+// the closing quote as an unterminated quoted field, so it keeps consuming
+// following lines until the next stray quote. OpenBIIN's issuer names contain
+// 126 values of that shape — the live data has rows such as
+//
+//	540294,00,"ARMENIAN CARD" CJSC,AM,mastercard,credit
+//
+// and reading the 100 shards with encoding/csv merged 4,520 real rows into
+// neighbouring records, silently dropping them. OpenBIIN's own contribution
+// rules forbid commas inside a column and require the whole value to be quoted
+// when one appears, and its production reader splits the file on newlines, so
+// every record is on exactly one line. Reading line by line keeps one malformed
+// issuer name from costing every record after it.
+type lineReader struct {
+	scanner *bufio.Scanner
+	line    strings.Reader
+	reader  *csv.Reader
+}
+
+func newLineReader(reader io.Reader) *lineReader {
+	scanner := bufio.NewScanner(reader)
+	// Issuer names are short; the ceiling only guards against a runaway line.
+	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	return &lineReader{scanner: scanner}
+}
+
+func (r *lineReader) Read() ([]string, error) {
+	for {
+		if !r.scanner.Scan() {
+			if err := r.scanner.Err(); err != nil {
+				return nil, err
+			}
+			return nil, io.EOF
+		}
+		line := r.scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		r.line.Reset(line)
+		r.reader = csv.NewReader(&r.line)
+		r.reader.FieldsPerRecord = -1
+		r.reader.LazyQuotes = true
+		r.reader.TrimLeadingSpace = true
+		return r.reader.Read()
+	}
+}
+
+func NewCSVSource(source io.Reader, sourceID, format string, updated time.Time) (*CSVSource, error) {
+	var reader rowReader
+	if format == FormatOpenBIIN {
+		reader = newLineReader(source)
+	} else {
+		csvReader := csv.NewReader(source)
+		csvReader.FieldsPerRecord = -1
+		csvReader.LazyQuotes = true
+		csvReader.TrimLeadingSpace = true
+		reader = csvReader
+	}
+	header, err := reader.Read()
 	if err != nil {
 		return nil, fmt.Errorf("read CSV header: %w", err)
 	}
@@ -74,12 +158,18 @@ func NewCSVSource(reader io.Reader, sourceID, format string, updated time.Time) 
 	if err != nil {
 		return nil, err
 	}
-	return &CSVSource{reader: csvReader, columns: columns, sourceID: sourceID, updated: updated}, nil
+	return &CSVSource{reader: reader, columns: columns, format: format, sourceID: sourceID, updated: updated}, nil
 }
 
 func (s *CSVSource) Next() bool {
 	if s.err != nil {
 		return false
+	}
+	// Drain the remaining records of the row read previously.
+	if len(s.pending) > 0 {
+		s.current = s.pending[0]
+		s.pending = s.pending[1:]
+		return true
 	}
 	for {
 		row, err := s.reader.Read()
@@ -91,12 +181,17 @@ func (s *CSVSource) Next() bool {
 			return false
 		}
 		s.total++
-		record, err := s.parse(row)
-		if err != nil {
+		records, dropped := s.parseRow(row)
+		if len(records) == 0 {
 			s.invalid++
 			continue
 		}
-		s.current = record
+		// A sub-range the upstream file lists but that cannot be represented is
+		// not fatal on its own, but it is counted so a source that silently
+		// loses data is visible in the import log and in sources.skipped_rows.
+		s.ranges += int64(dropped)
+		s.current = records[0]
+		s.pending = records[1:]
 		return true
 	}
 }
@@ -116,6 +211,91 @@ func (s *CSVSource) Err() error         { return s.err }
 func (s *CSVSource) TotalRows() int64   { return s.total }
 func (s *CSVSource) InvalidRows() int64 { return s.invalid }
 
+// InvalidRanges reports how many sub-range blocks were dropped from rows that
+// were otherwise imported. It is always zero for one-record-per-row formats.
+func (s *CSVSource) InvalidRanges() int64 { return s.ranges }
+
+// parseRow maps one CSV row to the records it describes. dropped counts blocks
+// within the row that could not be represented; a row that yields no records at
+// all is skipped by Next and counted as invalid.
+func (s *CSVSource) parseRow(row []string) (records []Record, dropped int) {
+	if s.format == FormatOpenBIIN {
+		return s.parseOpenBIIN(row)
+	}
+	record, err := s.parse(row)
+	if err != nil {
+		return nil, 0
+	}
+	return []Record{record}, 0
+}
+
+// parseOpenBIIN expands one OpenBIIN row into its 8-digit sub-range records.
+//
+// Upstream stores a fixed 6-digit BIN6 plus a "Ranges" column holding the 7th
+// and 8th PAN digits as pipe-separated contiguous blocks ("00-19|50-99"). A
+// block is either "NN-MM" or a single "NN". Each block becomes one record whose
+// IIN range is BIN6+first..BIN6+last, which is exactly the range shape the
+// bin_records containment index already answers.
+//
+// Blocks that are blank, non-numeric, mixed-width or reversed are dropped
+// rather than guessed at, and rows that lose every block are skipped.
+func (s *CSVSource) parseOpenBIIN(row []string) ([]Record, int) {
+	bin6 := digits(field(row, s.columns.start))
+	if len(bin6) != openbiinPrefixLength {
+		return nil, 0
+	}
+	blocks := strings.Split(field(row, s.columns.end), "|")
+	records := make([]Record, 0, len(blocks))
+	dropped := 0
+	for _, block := range blocks {
+		first, last, ok := openbiinBlock(block)
+		if !ok {
+			dropped++
+			continue
+		}
+		start, end := bin6+first, bin6+last
+		start8, end8, err := NormalizeRange(start, end)
+		if err != nil {
+			dropped++
+			continue
+		}
+		records = append(records, s.buildRecord(row, start, end, start8, end8))
+	}
+	return records, dropped
+}
+
+// openbiinBlock parses one pipe-separated sub-range block into its first and
+// last digit strings.
+//
+// Both ends must be exactly openbiinRangeDigits digits. Upstream's rules and
+// every block in the live data use the two digits after BIN6 ("05" for the
+// single 8-digit BIN ending 05, "00-99" for the whole block). A wider block
+// would not fit the 8-digit space this schema stores, and a narrower one would
+// describe an ambiguous 7-digit prefix rather than a real issuer range, so both
+// are rejected instead of guessed at.
+func openbiinBlock(block string) (string, string, bool) {
+	block = strings.TrimSpace(block)
+	if block == "" {
+		return "", "", false
+	}
+	first, last := block, block
+	if dash := strings.IndexByte(block, '-'); dash >= 0 {
+		first, last = strings.TrimSpace(block[:dash]), strings.TrimSpace(block[dash+1:])
+	}
+	first, last = digits(first), digits(last)
+	if first == "" || last == "" {
+		return "", "", false
+	}
+	if len(first) != openbiinRangeDigits || len(last) != openbiinRangeDigits {
+		return "", "", false
+	}
+	// Equal-width digit strings compare numerically under string ordering.
+	if last < first {
+		return "", "", false
+	}
+	return first, last, true
+}
+
 func (s *CSVSource) parse(row []string) (Record, error) {
 	start := digits(field(row, s.columns.start))
 	end := digits(field(row, s.columns.end))
@@ -132,7 +312,13 @@ func (s *CSVSource) parse(row []string) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	return s.buildRecord(row, start, end, start8, end8), nil
+}
 
+// buildRecord copies the row's shared metadata onto one IIN range. Every format
+// funnels through here so a row that expands into several ranges carries
+// identical issuer, country and type values on each of them.
+func (s *CSVSource) buildRecord(row []string, start, end string, start8, end8 int64) Record {
 	record := Record{
 		SourceID: s.sourceID, IINStart: start, IINEnd: end, IINLength: int16(len(start)), Start8: start8, End8: end8,
 		Scheme: enum(field(row, s.columns.scheme)), Brand: clean(field(row, s.columns.brand)),
@@ -155,7 +341,7 @@ func (s *CSVSource) parse(row []string) (Record, error) {
 	if len(record.CountryAlpha3) != 3 {
 		record.CountryAlpha3 = ""
 	}
-	return record, nil
+	return record
 }
 
 func mapColumns(header []string, format string) (columnMap, error) {
@@ -174,19 +360,34 @@ func mapColumns(header []string, format string) (columnMap, error) {
 		return -1
 	}
 
-	start := find("iin_start", "iinstart", "range_start", "bin_start", "binstart", "bin", "iin", "prefix")
+	startAliases := []string{"iin_start", "iinstart", "range_start", "bin_start", "binstart", "bin", "iin", "prefix"}
+	endAliases := []string{"iin_end", "iinend", "range_end", "bin_end", "binend"}
+	if format == FormatOpenBIIN {
+		// OpenBIIN names its columns BIN6/Ranges rather than IIN start/end.
+		startAliases = []string{"bin6", "bin", "iin", "iin_start", "prefix"}
+		endAliases = []string{"ranges", "range", "sub_ranges", "subranges", "iin_end"}
+	}
+	start := find(startAliases...)
 	// A maintained community file has historically replaced the first "BIN"
 	// header cell with digits while leaving every other header intact. Detect
 	// that shape so one upstream typo does not take the whole service offline.
-	if start < 0 && len(normalized) > 1 && digits(normalized[0]) != "" && find("type", "category", "issuer") >= 0 {
+	if start < 0 && format != FormatOpenBIIN && len(normalized) > 1 && digits(normalized[0]) != "" && find("type", "category", "issuer") >= 0 {
 		start = 0
 	}
 	if start < 0 {
 		return columnMap{}, errors.New("CSV has no BIN/IIN start column")
 	}
+	end := find(endAliases...)
+	if format == FormatOpenBIIN && end < 0 {
+		// Importing an OpenBIIN file without its sub-range column would install
+		// one 6-digit record per row and silently discard every narrower range,
+		// so this is a hard error rather than a fallback.
+		return columnMap{}, errors.New("openbiin CSV has no Ranges column")
+	}
 
 	columns := columnMap{
-		start: start, end: find("iin_end", "iinend", "range_end", "bin_end", "binend"),
+		start:        start,
+		end:          end,
 		numberLength: find("number_length", "card_number_length", "length"), luhn: find("luhn"),
 		cardType: find("type", "card_type", "funding"), cardLevel: find("category", "level", "card_level"),
 		prepaid:     find("prepaid", "is_prepaid"),
@@ -203,6 +404,12 @@ func mapColumns(header []string, format string) (columnMap, error) {
 	case "ranges":
 		columns.scheme = find("scheme", "network")
 		columns.brand = find("brand", "card_brand", "product")
+	case FormatOpenBIIN:
+		// Upstream's "Brand" is the payment network (visa, mastercard), the same
+		// meaning bin-list-data's Brand column carries, so it maps to scheme and
+		// the product-level brand stays empty.
+		columns.scheme = find("brand", "scheme", "network")
+		columns.brand = find("card_brand", "product")
 	case "binlist":
 		columns.scheme = find("scheme", "network", "brand")
 		columns.brand = find("card_brand", "product")
