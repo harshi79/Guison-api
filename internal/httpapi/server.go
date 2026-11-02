@@ -150,7 +150,7 @@ func (s *Server) dataImport(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	format := r.FormValue("format")
-	if format != "binlist" && format != "ranges" && format != "generic" {
+	if format != "binlist" && format != "ranges" && format != "generic" && format != "openbiin" {
 		s.renderDataPage(w, r, http.StatusBadRequest, "", "Choose a supported CSV format.")
 		return
 	}
@@ -354,6 +354,7 @@ const dataPageHTML = `<!doctype html>
         <option value="binlist">BIN list (BIN, Brand, Type, Category, Issuer...)</option>
         <option value="ranges">Ranges (iin_start, iin_end, scheme, bank_name...)</option>
         <option value="generic">Generic header aliases</option>
+        <option value="openbiin">OpenBIIN (BIN6, Ranges, Issuer, Country, Brand, Type)</option>
       </select>
       <label>Import mode</label>
       <fieldset>
